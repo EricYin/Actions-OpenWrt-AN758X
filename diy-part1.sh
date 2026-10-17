@@ -22,7 +22,7 @@ mkdir -p "$PKG_DIR"
 # 见 files/sbin/tempinfo（概览页「温度」行：CPU / WiFi / PON 温度 + 光功率）
 # ---------------------------------------------------------
 ADD_AIROHA_NPU=true    # luci-app-airoha-npu：Airoha SoC 状态页（NPU/CPU/Frame Engine/PPE）
-ADD_FLUENT=false       # luci-theme-fluent：Fluent 2 风格主题
+ADD_FLUENT=true       # luci-theme-fluent：Fluent 2 风格主题
 ADD_FLUENT_LITE=false  # luci-theme-fluent-lite：轻量版（与 fluent 互斥，二选一）
 ADD_FLUENT_DASH=false  # luci-mod-fluentdashboard：可选状态概览卡片
 ADD_PASSWALL=false     # luci-app-passwall（含依赖源）
