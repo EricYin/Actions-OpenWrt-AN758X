@@ -290,7 +290,7 @@ jobs:
           # 2) 匿名被拒才要令牌（只从 Secret 取）
           TOKEN="${SEC_TOKEN:-${SEC_TOKEN_LEGACY}}"
           if [ -z "$TOKEN" ]; then
-            echo "::error::仓库 ${PRIVATE_REPO} 匿名访问被拒且 Secret 里没有可用凭证：请在仓库 Settings → Secrets and variables → Actions → Repository secrets 添加 PRIVATE_REPO_TOKEN（PAT 需对该仓库有 Contents 读权限；组织仓库还要授权 SSO）"
+            echo "::error::仓库 ${PRIVATE_REPO} 匿名访问被拒且 Secret 里没有可用凭证：请在仓库 Settings → Secrets and variables → Actions → Repository secrets 添加 PRIVATE_REPO_TOKEN（PAT 需对该仓库有 Contents 读权限）"
             echo "--- git 原始错误 ---"
             printf '%s\n' "$ERR" | sanitize
             exit 1
@@ -316,7 +316,7 @@ jobs:
             echo "::error::仓库 ${PRIVATE_REPO} 的分支 ${PRIVATE_REPO_BRANCH} 带凭证访问失败"
             echo "--- git 原始错误（已脱敏）---"
             printf '%s\n' "$ERR" | sanitize
-            echo "常见原因：PAT 无效/已吊销、对该仓库无读权限（fine-grained 必须 Repository access 选中该仓库且 Permissions → Contents: Read-only，只勾默认的 Metadata 读不了 git；组织仓库还要 SSO 授权）、分支名不正确、令牌带入多余字符（空格/换行）"
+            echo "常见原因：PAT 无效/已吊销、对该仓库无读权限（fine-grained 必须 Repository access 选中该仓库且 Permissions → Contents: Read-only，只勾默认的 Metadata 读不了 git；个人账号没有 SSO 这回事，只有组织仓库且组织开了 SAML SSO 才需要授权 PAT）、分支名不正确、令牌带入多余字符（空格/换行）"
             exit 1
           fi
 
