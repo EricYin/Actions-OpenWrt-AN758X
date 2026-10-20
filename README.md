@@ -275,6 +275,40 @@ endif
 > 长期凭证请放仓库 Secret（Settings → Secrets and variables → Actions 添加
 > `PRIVATE_REPO_TOKEN`），运行输入只当临时覆盖用。组织仓库记得给 PAT 授权 SSO。
 
+## 仓库设置：Actions 权限（必看）
+
+本 workflow 依赖社区 action。若仓库 **Settings → Actions → General → Actions permissions**
+设成了「仅允许 qwe-qaq 自己的 action」，运行时会直接报错：
+
+> The actions `actions/checkout@v5`, ... are not allowed in qwe-qaq/Actions-OpenWrt-AN758X
+> because all actions must be from a repository owned by qwe-qaq.
+
+两种解法（改完点 **Save**，重新 Run workflow 即可）：
+
+1. **允许全部**（推荐，个人仓库）：选 `Allow all actions and reusable workflows`。
+2. **保留白名单**：选 `Allow qwe-qaq, and select non-qwe-qaq, actions and reusable workflows`，
+   勾选 `Allow actions created by GitHub`，并在 `Allow or block specified actions` 白名单里加：
+
+   ```
+   actions/*
+   softprops/*
+   mxschmitt/*
+   Mattraks/*
+   dev-drprasad/*
+   ```
+
+当前 workflow 用到的全部外部 action（改白名单时对照检查）：
+
+| action | 用途 |
+|--------|------|
+| `actions/checkout` | 检出本仓库 |
+| `actions/cache` / `actions/cache/restore` / `actions/cache/save` | dl / 工具链 / ccache 缓存 |
+| `actions/upload-artifact` | 上传 bin / firmware Artifact |
+| `softprops/action-gh-release` | 发布 Release |
+| `Mattraks/delete-workflow-runs` | 清理旧运行记录 |
+| `dev-drprasad/delete-older-releases` | 清理旧 Release |
+| `mxschmitt/action-tmate` | SSH 调试（`ssh=false` 时不会启动） |
+
 ## 首次使用建议
 
 免费 runner 单次上限 6 小时，首次全量编译（工具链 + 内核 + 全包）大概率超时：
