@@ -34,6 +34,52 @@ jobs:
       # 必须验证凭证步骤能正确清掉它，否则它会盖掉 insteadOf 注入的 PAT
       - name: Checkout (复现真实环境的 extraheader)
         uses: actions/checkout@v5
+        with:
+          # 与 build-ponwrt.yml 保持一致：不持久化凭据。
+          # checkout 默认会把 http.https://github.com/.extraheader 写进【本地】
+          # .git/config，带的是仅本仓库权限的 GITHUB_TOKEN，会盖掉 PAT → 私有仓库 404
+          persist-credentials: false
+
+      # =========================================================
+      # 预检：把「令牌有没有效」和「配置有没有被污染」分开定位，
+      # 失败时不用猜。纯信息展示，不拦截流程
+      # =========================================================
+      - name: Pre-flight diagnostics
+        env:
+          SEC_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          SEC_TOKEN_LEGACY: ${{ secrets.FTTR_TOKEN }}
+        run: |
+          TOKEN="${SEC_TOKEN:-${SEC_TOKEN_LEGACY}}"
+
+          echo "=== 1. extraheader 残留检查（只报存在性，不打印内容）==="
+          for scope in global local; do
+            if git config --$scope --get http.https://github.com/.extraheader >/dev/null 2>&1; then
+              echo "  ⚠ $scope 配置里有 extraheader（凭证步骤会清掉它）"
+            else
+              echo "  ✅ $scope 配置无 extraheader"
+            fi
+          done
+
+          if [ -z "$TOKEN" ]; then
+            echo
+            echo "=== 2. Secret 里没有令牌（PRIVATE_REPO_TOKEN / FTTR_TOKEN 均为空）==="
+            exit 0
+          fi
+
+          echo
+          echo "=== 2. 令牌身份与仓库访问权限（GitHub API，不打印令牌）==="
+          LOGIN=$(curl -s -H "Authorization: Bearer $TOKEN" https://api.github.com/user \
+                    | grep -m1 '"login"' | sed -E 's/.*"login": *"([^"]+)".*/\1/')
+          echo "  令牌归属: ${LOGIN:-无法解析（令牌可能无效/已吊销）}"
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+                   -H "Authorization: Bearer $TOKEN" \
+                   "https://api.github.com/repos/${PRIVATE_REPO}")
+          case "$CODE" in
+            200) echo "  API 访问 ${PRIVATE_REPO}: ✅ 200（令牌看得见该仓库）" ;;
+            404) echo "  API 访问 ${PRIVATE_REPO}: ❌ 404（令牌无权限，或 Repository access 没选中该仓库）" ;;
+            401) echo "  API 访问 ${PRIVATE_REPO}: ❌ 401（令牌无效/已吊销）" ;;
+            *)   echo "  API 访问 ${PRIVATE_REPO}: ❌ HTTP $CODE" ;;
+          esac
 
       # =========================================================
       # 凭证步骤：与 build-ponwrt.yml 的 Setup private repo
@@ -71,7 +117,12 @@ jobs:
           echo "::add-mask::$TOKEN"
 
           # checkout 注入的 github.com 通用 Authorization 头会盖掉我们的 PAT，先清掉
+          # ⚠ checkout 写的是【本地】.git/config（见 actions/checkout 源码
+          #   git-auth-helper.ts configureToken 默认 configPath=.git/config），
+          #   本地配置优先级高于全局，只 unset --global 根本清不掉！
+          #   2026-10-20 实测：只清全局时带令牌仍 404 Repository not found。
           git config --global --unset-all http.https://github.com/.extraheader 2>/dev/null || true
+          git config --local --unset-all http.https://github.com/.extraheader 2>/dev/null || true
 
           # 只给这一条 URL 注入凭证，其它 clone 不受影响
           for suffix in "" ".git"; do

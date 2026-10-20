@@ -141,6 +141,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          # 不持久化凭据：checkout 会把 http.https://github.com/.extraheader
+          # 写进【本地】.git/config，那个头带的是仅本仓库权限的 GITHUB_TOKEN，
+          # 会盖掉凭证步骤注入的 PAT，导致私有仓库 404（本流程无 git push，
+          # 后续只用 gh CLI + env 里的 GITHUB_TOKEN，不需要 git 持久化凭据）
+          persist-credentials: false
 
       # =========================================================
       # 0. 解析机型 -> 自动校正 SoC，导出 device name
@@ -298,8 +304,13 @@ jobs:
           echo "::add-mask::$TOKEN"
 
           # checkout 注入的 github.com 通用 Authorization 头会盖掉我们的 PAT，先清掉
-          # （后续只用 gh CLI + GITHUB_TOKEN，不依赖 git credential）
+          # ⚠ checkout 写的是【本地】.git/config（见 actions/checkout 源码
+          #   git-auth-helper.ts configureToken 默认 configPath=.git/config），
+          #   本地配置优先级高于全局，只 unset --global 根本清不掉！
+          #   2026-10-20 实测：只清全局时带令牌仍 404 Repository not found。
+          #   persist-credentials: false 已让 checkout 不再写，这里双保险。
           git config --global --unset-all http.https://github.com/.extraheader 2>/dev/null || true
+          git config --local --unset-all http.https://github.com/.extraheader 2>/dev/null || true
 
           # 只给这一条 URL 注入凭证，其它 clone 不受影响
           for suffix in "" ".git"; do
