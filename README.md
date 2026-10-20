@@ -246,6 +246,35 @@ endif
 
 > 提醒：开启后 `.ccache` 会额外占用磁盘，注意 runner 剩余空间。
 
+## 私有仓库（openwrt-fttr）拉取凭证
+
+`openwrt-fttr`（`h3c-fmcs` / `h3c-fttr-tools` / `h3c-fmcs-firmware` 的来源）是**私有仓库**，
+匿名 clone 会失败。Run workflow 表单提供三个输入项：
+
+| 输入项 | 默认 | 说明 |
+|--------|------|------|
+| `private_repo` | `qwe-qaq/openwrt-fttr` | 私有仓库；选 `none` = 本次不拉，FTTR 相关包整体跳过 |
+| `private_repo_branch` | `main` | 私有仓库分支 |
+| `private_repo_token` | 空 | 该仓库的读取 PAT（classic 勾 `repo`，或 fine-grained 单仓库只读） |
+
+凭证优先级：**运行输入 `private_repo_token` > Secret `PRIVATE_REPO_TOKEN` > Secret `FTTR_TOKEN`**。
+三者都空且 `private_repo` 不是 `none` 时，`Setup private repo credentials` 步骤直接报错退出，
+不会白跑一轮编译。
+
+实现方式（为什么不把 token 拼进 clone URL）：
+
+- 用 `git config --global url.<带token的URL>.insteadOf <裸URL>` 只给这一个仓库注入凭证，
+  diy-part1.sh 里的 clone URL 保持原样 —— token 不出现在命令行，也不会被 echo 进日志；
+- 令牌先 `::add-mask::` 掩码，双保险；
+- 会先清掉 actions/checkout 注入的 `http.https://github.com/.extraheader`
+  （那个头带的是**本仓库**的 GITHUB_TOKEN，对私有 openwrt-fttr 无效，还会盖掉 insteadOf 的凭证）；
+- 注入后用 `git ls-remote` 预检分支可达性：PAT 无效 / 无读权限 / 分支名写错，在这一步就报错，
+  而不是等 diy-part1.sh clone 失败。
+
+> ⚠️ Run workflow 的输入值对能触发本 workflow 的人可见，并随运行记录留存 ——
+> 长期凭证请放仓库 Secret（Settings → Secrets and variables → Actions 添加
+> `PRIVATE_REPO_TOKEN`），运行输入只当临时覆盖用。组织仓库记得给 PAT 授权 SSO。
+
 ## 首次使用建议
 
 免费 runner 单次上限 6 小时，首次全量编译（工具链 + 内核 + 全包）大概率超时：
