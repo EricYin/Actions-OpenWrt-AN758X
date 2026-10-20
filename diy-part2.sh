@@ -70,6 +70,14 @@ if [ -f .config ]; then
   sed -i '/^CONFIG_PACKAGE_zoneinfo-asia=/d; /^# CONFIG_PACKAGE_zoneinfo-asia is not set/d' .config
   echo "CONFIG_PACKAGE_zoneinfo-asia=y    # 亚洲时区数据库（中国时区需要）" >> .config
   echo "✅ zoneinfo-asia 已加入 .config"
+
+  # libffi：见 diy-part1.sh 的同名段落。源码树原本没有这个包，
+  # python3(3.14) 的 _ctypes 却必须要它的 ffi.h / libffi.pc，
+  # 缺了就 fatal error 拖垮 world。这里显式打开 target 版，
+  # 让 Build/InstallDev 把头文件装进 staging_dir。
+  sed -i '/^CONFIG_PACKAGE_libffi=/d; /^# CONFIG_PACKAGE_libffi is not set/d' .config
+  echo "CONFIG_PACKAGE_libffi=y           # python3 _ctypes 需要 ffi.h / libffi.pc" >> .config
+  echo "✅ libffi 已加入 .config"
 fi
 
 # ---------------------------------------------------------
