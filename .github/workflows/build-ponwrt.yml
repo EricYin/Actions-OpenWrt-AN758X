@@ -27,6 +27,10 @@ env:
   IGNORE_CACHE: ${{ github.event.inputs.ignore_cache || 'false' }}
   FW_BUILD_TIME: ''                 # 留空 = 自动取构建时时间（Asia/Shanghai）
   FW_DESC_SUFFIX: ''               # 留空 = "· qwe · <构建时间>"；填了则完全自定义
+  # ---- 私有仓库（FTTR 三件套的来源，需凭证）----
+  # 填 none = 本次不拉私有仓库，FTTR 相关包整体跳过
+  PRIVATE_REPO: ${{ github.event.inputs.private_repo || 'qwe-qaq/openwrt-fttr' }}
+  PRIVATE_REPO_BRANCH: ${{ github.event.inputs.private_repo_branch || 'main' }}
 
 on:
   repository_dispatch:
@@ -100,6 +104,22 @@ on:
         options:
           - 'true'
           - 'false'
+      private_repo:
+        description: '拉取私有仓库（FTTR 三件套来源，需凭证）'
+        required: false
+        default: 'qwe-qaq/openwrt-fttr'
+        type: choice
+        options:
+          - qwe-qaq/openwrt-fttr
+          - none
+      private_repo_branch:
+        description: '私有仓库分支'
+        required: false
+        default: 'main'
+      private_repo_token:
+        description: '私有仓库凭证 PAT（留空则用仓库 Secret PRIVATE_REPO_TOKEN / FTTR_TOKEN）'
+        required: false
+        default: ''
       ssh:
         description: 'SSH connection to Actions (仅 main 分支、仓库所有者可触发)'
         required: false
@@ -232,6 +252,59 @@ jobs:
           echo "FW_AUTHOR=${FW_AUTHOR:-qwe}" >> "$GITHUB_ENV"
 
           cd openwrt && echo "commit: $(git rev-parse --short HEAD)"
+
+      # =========================================================
+      # 2.5 私有仓库凭证（运行时输入 PAT，或使用仓库 Secret）
+      #
+      # 背景：openwrt-fttr 是私有仓库，diy-part1.sh 里裸 clone 会 401 失败并
+      # exit 1。这里把凭证写进 git 配置（insteadOf），diy-part1.sh 的 clone
+      # URL 保持原样即可，token 既不会出现在命令行，也不会被 echo 进日志。
+      #
+      # 凭证优先级：运行时输入 private_repo_token
+      #              > secrets.PRIVATE_REPO_TOKEN > secrets.FTTR_TOKEN
+      # ⚠ workflow_dispatch 的输入值会明文出现在 run 页面、也能被 API 读到，
+      #   长期凭证请放 Secret，运行时输入只当临时覆盖用。
+      # =========================================================
+      - name: Setup private repo credentials
+        id: private_repo
+        env:
+          IN_TOKEN: ${{ github.event.inputs.private_repo_token }}
+          SEC_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          SEC_TOKEN_LEGACY: ${{ secrets.FTTR_TOKEN }}
+        run: |
+          # 本次不拉私有仓库：关掉 FTTR 全家桶（开关支持环境变量覆盖）
+          if [ "${PRIVATE_REPO}" = "none" ]; then
+            echo "ADD_FTTR=false" >> "$GITHUB_ENV"
+            echo "⚠ PRIVATE_REPO=none —— 跳过私有仓库，kmod-h3c-fmcs / h3c-fttr-tools / h3c-fmcs-firmware / luci-app-fttr 都不会编进固件"
+            exit 0
+          fi
+
+          TOKEN="${IN_TOKEN:-${SEC_TOKEN:-${SEC_TOKEN_LEGACY}}}"
+          if [ -z "$TOKEN" ]; then
+            echo "::error::缺少私有仓库凭证：请在本页填 private_repo_token，或在仓库 Settings → Secrets and variables → Actions 添加 PRIVATE_REPO_TOKEN（PAT 需有 repo 读权限；组织仓库还要授权 SSO）"
+            exit 1
+          fi
+          echo "::add-mask::$TOKEN"
+
+          # checkout 注入的 github.com 通用 Authorization 头会盖掉我们的 PAT，先清掉
+          # （后续只用 gh CLI + GITHUB_TOKEN，不依赖 git credential）
+          git config --global --unset-all http.https://github.com/.extraheader 2>/dev/null || true
+
+          # 只给这一条 URL 注入凭证，其它 clone 不受影响
+          for suffix in "" ".git"; do
+            git config --global \
+              "url.https://x-access-token:${TOKEN}@github.com/${PRIVATE_REPO}${suffix}.insteadOf" \
+              "https://github.com/${PRIVATE_REPO}${suffix}"
+          done
+
+          # 提前自检：凭证无效 / 分支不存在就在这里失败，别等到 diy-part1.sh
+          if ! git ls-remote --exit-code --heads \
+               "https://github.com/${PRIVATE_REPO}" "refs/heads/${PRIVATE_REPO_BRANCH}" >/dev/null 2>&1; then
+            echo "::error::私有仓库 ${PRIVATE_REPO} 的分支 ${PRIVATE_REPO_BRANCH} 访问失败：检查 PAT 是否有效、对该仓库是否有读权限（组织仓库需 SSO 授权）、分支名是否正确"
+            exit 1
+          fi
+
+          echo "✅ 凭证已注入：https://github.com/${PRIVATE_REPO} (分支 ${PRIVATE_REPO_BRANCH})"
 
       # =========================================================
       # 3. dl 下载缓存
