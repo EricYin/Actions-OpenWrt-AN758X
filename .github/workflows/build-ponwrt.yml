@@ -117,10 +117,6 @@ on:
         description: '私有仓库分支'
         required: false
         default: 'main'
-      private_repo_token:
-        description: '私有仓库凭证 PAT（留空则用仓库 Secret PRIVATE_REPO_TOKEN / FTTR_TOKEN）'
-        required: false
-        default: ''
       ssh:
         description: 'SSH connection to Actions (仅 main 分支、仓库所有者可触发)'
         required: false
@@ -257,20 +253,19 @@ jobs:
       # =========================================================
       # 2.5 仓库凭证（openwrt-fttr feed 的来源）
       #
-      # 流程：先试匿名访问 —— 仓库已转公开时（qwe-qaq/openwrt-fttr 当前
-      # 就是公开的）零凭证直接过；匿名被拒才要求令牌，用 git insteadOf
-      # 注入，diy-part1.sh 的 clone URL 保持原样，token 既不会出现在
-      # 命令行，也不会被 echo 进日志（另有 add-mask 双保险）。
+      # 流程：先试匿名访问 —— 万一哪天仓库转公开就零凭证直接过；
+      # qwe-qaq/openwrt-fttr 当前是私有仓库，匿名必然被拒，随后用
+      # git insteadOf 注入 Secret 里的 PAT，diy-part1.sh 的 clone URL
+      # 保持原样，token 既不会出现在命令行，也不会被 echo 进日志
+      # （另有 add-mask 双保险）。
       #
-      # 凭证优先级：运行时输入 private_repo_token
-      #              > secrets.PRIVATE_REPO_TOKEN > secrets.FTTR_TOKEN
+      # 凭证来源：secrets.PRIVATE_REPO_TOKEN > secrets.FTTR_TOKEN（旧名兼容）
       # ⚠ workflow_dispatch 的输入值会明文出现在 run 页面、也能被 API 读到，
-      #   长期凭证请放 Secret，运行时输入只当临时覆盖用。
+      #   所以不设令牌输入框，长期凭证只放 Secret，换令牌=更新 Secret 后重跑。
       # =========================================================
       - name: Setup private repo credentials
         id: private_repo
         env:
-          IN_TOKEN: ${{ github.event.inputs.private_repo_token }}
           SEC_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
           SEC_TOKEN_LEGACY: ${{ secrets.FTTR_TOKEN }}
         run: |
@@ -292,10 +287,10 @@ jobs:
             exit 0
           fi
 
-          # 2) 匿名被拒才要令牌
-          TOKEN="${IN_TOKEN:-${SEC_TOKEN:-${SEC_TOKEN_LEGACY}}}"
+          # 2) 匿名被拒才要令牌（只从 Secret 取）
+          TOKEN="${SEC_TOKEN:-${SEC_TOKEN_LEGACY}}"
           if [ -z "$TOKEN" ]; then
-            echo "::error::仓库 ${PRIVATE_REPO} 匿名访问被拒且未提供凭证：请在本页填 private_repo_token，或在仓库 Settings → Secrets and variables → Actions 添加 PRIVATE_REPO_TOKEN（PAT 需有 repo 读权限；组织仓库还要授权 SSO）"
+            echo "::error::仓库 ${PRIVATE_REPO} 匿名访问被拒且 Secret 里没有可用凭证：请在仓库 Settings → Secrets and variables → Actions → Repository secrets 添加 PRIVATE_REPO_TOKEN（PAT 需对该仓库有 Contents 读权限；组织仓库还要授权 SSO）"
             echo "--- git 原始错误 ---"
             printf '%s\n' "$ERR" | sanitize
             exit 1

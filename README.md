@@ -249,18 +249,24 @@ endif
 ## 私有仓库（openwrt-fttr）拉取凭证
 
 `openwrt-fttr`（`h3c-fmcs` / `h3c-fttr-tools` / `h3c-fmcs-firmware` 的来源）
-**当前是公开仓库**——`Setup private repo credentials` 步骤会先用 `git ls-remote`
-试匿名访问，公开状态零凭证直接过；只有匿名被拒（仓库转回私有）时才需要令牌。
-Run workflow 表单提供三个输入项：
+**是私有仓库**，拉取它必须要有凭证。`Setup private repo credentials` 步骤会先用
+`git ls-remote` 试匿名访问（万一哪天转公开就零凭证直接过），匿名被拒后自动改用
+仓库 Secret 里的 PAT。Run workflow 表单只提供两个输入项：
 
 | 输入项 | 默认 | 说明 |
 |--------|------|------|
 | `private_repo` | `qwe-qaq/openwrt-fttr` | feed 仓库（**私有**，必须配令牌）；选 `none` = 本次不拉，FTTR 相关包整体跳过 |
 | `private_repo_branch` | `main` | 分支名 |
-| `private_repo_token` | 空 | 该仓库的读取 PAT；classic 勾 `repo`；fine-grained 需 Repository access 选中该仓库 + Permissions → **Contents: Read-only**（默认只有 Metadata 读权限，git 拉取会报 Repository not found） |
 
-凭证优先级：**运行输入 `private_repo_token` > Secret `PRIVATE_REPO_TOKEN` > Secret `FTTR_TOKEN`**。
-三者都空且仓库确实需要凭证时，步骤会报错退出并附带 git 的原始错误（已脱敏），不会白跑一轮编译。
+凭证来源：**Secret `PRIVATE_REPO_TOKEN` > Secret `FTTR_TOKEN`（旧名兼容）**。
+表单里**没有**令牌输入框——workflow_dispatch 的输入值会明文显示在 run 页面、也能被
+API 读到，不安全；要换令牌就更新 Secret 后重跑。两个 Secret 都为空且仓库确实需要
+凭证时，步骤会报错退出并附带 git 的原始错误（已脱敏），不会白跑一轮编译。
+
+PAT 要求：classic 勾 `repo`；fine-grained 需 Repository access 选中该仓库 +
+Permissions → **Contents: Read-only**（默认只有 Metadata 读权限，git 拉取会报
+Repository not found）。Secret 位置：仓库 Settings → Secrets and variables →
+Actions → Repository secrets，名字必须一字不差叫 `PRIVATE_REPO_TOKEN`。
 
 实现方式（为什么不把 token 拼进 clone URL）：
 
