@@ -41,12 +41,16 @@ ADD_OAF=false          # luci-app-oaf（应用过滤，含内核模块，高风�
 ADD_LUCI_APP=true       # qwe3017/luci-app 仓库（monorepo）
                         #   ├─ luci-app-natmode     NAT 类型三选一（网络 → NAT 类型）
                         #   └─ luci-app-pon-status  PON 光模块卡片（概览页「系统」下一格）
-ADD_FTTR=true           # luci-app-fttr：FTTR 管理界面（网络 → FTTR）★仅 HM2004-DU
-ADD_FMCS_FW=true        # h3c-fmcs-firmware：HM2004-DU Micro-OLT FPGA 比特流 ★仅 HM2004-DU
+ADD_FTTR=true           # FTTR 全家桶总开关（下面的子开关都受它管）★仅 HM2004-DU
+ADD_FMCS=true           # h3c-fmcs：Micro-OLT FPGA 内核驱动（kmod-h3c-fmcs）
+ADD_FTTR_TOOLS=true     # h3c-fttr-tools：fttrd 控制器 + fttrctl（Rust 包）
+ADD_FMCS_FW=true        # h3c-fmcs-firmware：FPGA 比特流 FTTR_TOP.sbit
+                        # （以上三个都来自 openwrt-fttr feed，bitstream 由驱动加载）
 
-# 上面两个包只对 HM2004-DU 有意义：一个管 FTTR 主从设备，一个装的就是
-# 这颗 FPGA 的 bitstream。workflow 会把 PROFILE 导出成环境变量，非 2004
-# 机型直接跳过，不白花 clone 时间；本地手工跑（PROFILE 为空）按 2004 处理。
+# 这四个包只对 HM2004-DU 有意义：驱动按 @(TARGET_airoha_an7581) 限定了
+# target，界面和后端都围着重型 FTTR 主从设备转。workflow 会把 PROFILE
+# 导出成环境变量，非 2004 机型直接跳过，不白花 clone 时间；本地手工跑
+# （PROFILE 为空）按 2004 处理。
 FTTR_PROFILE="${PROFILE:-h3c_hm2004-du}"
 
 clone() {  # clone <url> <dir> [branch]
@@ -96,7 +100,19 @@ if [ "$ADD_LUCI_APP" = "true" ]; then
   rm -rf "$LUCI_APP_TMP"
 fi
 
-
+# =========================================================
+# luci-app-fttr —— FTTR 管理界面（网络 → FTTR）★HM2004-DU 专属
+#
+# 源：LazuliKao/luci-app-fttr（monorepo，包在 package/luci-app-fttr/ 子目录）
+#   ⚠ 和 fluent / qwe3017/luci-app 一样是「包在子目录」结构，不能整仓丢进
+#     package/custom —— buildroot 扫 package/ 只到 -maxdepth 5，整仓进去
+#     会把 src/、package/ 一起扫，包符号还对不上。必须拷子目录。
+#
+# 依赖（Makefile 里的 LUCI_DEPENDS）：
+#   +luci-base +rpcd +ucode +ucode-mod-fs +h3c-fttr-tools
+#   前四个 feeds 里有；h3c-fttr-tools（fttrctl 后端 + ucode 运行时）不在
+#   ImmortalWrt feeds，也不在 pon_drivers / pon_userspace —— 见下方硬校验。
+# =========================================================
 if [ "$ADD_FTTR" = "true" ] && [ "$FTTR_PROFILE" = "h3c_hm2004-du" ]; then
   FTTR_TMP="$(mktemp -d)/fttr"
   if ! clone https://github.com/LazuliKao/luci-app-fttr "$FTTR_TMP" main; then
@@ -111,44 +127,122 @@ if [ "$ADD_FTTR" = "true" ] && [ "$FTTR_PROFILE" = "h3c_hm2004-du" ]; then
   rm -rf "$PKG_DIR/luci-app-fttr"
   cp -a "$FTTR_TMP/package/luci-app-fttr" "$PKG_DIR/luci-app-fttr"
 
+  # Windows 检出会丢 executable bit，rpcd 插件与 hl202 脚本执行不了 → 页面全空。
+  # Makefile 里虽然有 Build/Prepare 的 chmod，这里先在源码树补一道更保险。
   chmod 0755 "$PKG_DIR/luci-app-fttr/root/usr/libexec/fttr-hl202" \
              "$PKG_DIR/luci-app-fttr/root/usr/libexec/rpcd/luci.fttr" 2>/dev/null || true
 
+  # po/zh_Hans 已经是 fttr.po（LUCI_BASENAME 命名），不用像 airoha-npu 那样改名
   echo "✅ 已拷贝: luci-app-fttr (版本 $(grep -m1 '^PKG_VERSION' "$PKG_DIR/luci-app-fttr/Makefile" 2>/dev/null | sed 's/PKG_VERSION:=//'))"
   rm -rf "$FTTR_TMP"
 fi
 
-if [ "$ADD_FMCS_FW" = "true" ] && [ "$FTTR_PROFILE" = "h3c_hm2004-du" ]; then
-  FMCS_TMP="$(mktemp -d)/luci-app"
-  if ! clone https://github.com/qwe-qaq/luci-app "$FMCS_TMP" main; then
-    echo "::error::qwe-qaq/luci-app 拉取失败，h3c-fmcs-firmware 会被 defconfig 剔除"
+# =========================================================
+# openwrt-fttr feed —— H3C HM2004-DU 下联 Micro-OLT 的官方 feed
+#
+# 一个仓库里带三个包，一次 clone 全部拿走（保证 bitstream 与驱动同版本）：
+#   h3c-fmcs          内核驱动 kmod-h3c-fmcs（SPI0 寄存器通道、IRQ26 事件、
+#                     /dev/fmcs_mci 字符设备、molt_omci/molt_ploam 虚拟网卡）
+#                     DEPENDS: @(TARGET_airoha_an7581) +kmod-spi-gpio
+#                     ← 本仓库 2004 profile 正是 airoha_an7581，条件满足
+#   h3c-fttr-tools    Rust 写的 fttrd 控制器 + fttrctl 命令入口 + 可裁剪 ACS
+#                     DEPENDS: $(RUST_ARCH_DEPENDS) +kmod-h3c-fmcs
+#                              +mosquitto-client +mosquitto-ssl +uci +ubus
+#                              +firewall4 +dnsmasq
+#   h3c-fmcs-firmware 就一个文件：FTTR_TOP.sbit → /lib/firmware/
+#
+# ★ 之前的判断在这里更正：驱动里确实有 request_firmware("FTTR_TOP.sbit")
+#   （fmcs_main.c 的 fmcs_fpga_work_fn + MODULE_FIRMWARE），所以 bitstream
+#   **不是**「装上没人用」——只要驱动 probe 成功，它会自己去 /lib/firmware
+#   取。真正的前置条件变成了「驱动能不能 probe」，见下面 DTS 那条。
+#
+# ⚠ 授权：h3c-fmcs-firmware 里装的是厂商 FPGA 二进制，Makefile 头的
+#   SPDX（GPL-2.0-only）只覆盖构建脚本本身，管不到这个 bitstream。自用
+#   没问题，随公开固件再分发要自己掂量。
+#
+# 来源（仓库对部分网络不可见，故全部可覆盖）：
+#   FTTR_FEED_URL / FTTR_FEED_BRANCH（默认 main，失败自动试 master）
+# =========================================================
+FTTR_FEED_URL="${FTTR_FEED_URL:-https://github.com/LazuliKao/openwrt-fttr}"
+
+if [ "$ADD_FTTR" = "true" ] && [ "$FTTR_PROFILE" = "h3c_hm2004-du" ]; then
+  FEED_TMP="$(mktemp -d)/openwrt-fttr"
+  FEED_BRANCH=""
+  for br in "${FTTR_FEED_BRANCH:-main}" master; do
+    rm -rf "$FEED_TMP"
+    clone "$FTTR_FEED_URL" "$FEED_TMP" "$br" 2>/dev/null || continue
+    [ -f "$FEED_TMP/h3c-fttr-tools/Makefile" ] || continue
+    FEED_BRANCH="$br"
+    break
+  done
+
+  if [ -z "$FEED_BRANCH" ]; then
+    echo "::error::openwrt-fttr 拉取失败（源：$FTTR_FEED_URL）"
+    echo "        该仓库对部分网络不可见；可先本地下载再用 FTTR_FEED_URL 指向可达镜像。"
+    echo "        暂时不需要 FTTR 就把上面的 ADD_FTTR 改成 false。"
     exit 1
   fi
-  if [ ! -f "$FMCS_TMP/h3c-fmcs-firmware/Makefile" ]; then
-    echo "::error::$FMCS_TMP/h3c-fmcs-firmware/Makefile 不存在"
-    exit 1
+  echo "   openwrt-fttr 分支: $FEED_BRANCH"
+
+  # --- h3c-fmcs（内核驱动）---
+  if [ "$ADD_FMCS" = "true" ]; then
+    if [ ! -f "$FEED_TMP/h3c-fmcs/Makefile" ]; then
+      echo "::error::$FEED_TMP/h3c-fmcs/Makefile 不存在"
+      exit 1
+    fi
+    rm -rf "$PKG_DIR/h3c-fmcs"
+    cp -a "$FEED_TMP/h3c-fmcs" "$PKG_DIR/h3c-fmcs"
+    echo "✅ 已拷贝: h3c-fmcs（内核驱动，包名 kmod-h3c-fmcs）"
   fi
 
-  rm -rf "$PKG_DIR/h3c-fmcs-firmware"
-  cp -a "$FMCS_TMP/h3c-fmcs-firmware" "$PKG_DIR/h3c-fmcs-firmware"
+  # --- h3c-fttr-tools（后端，Rust）---
+  if [ "$ADD_FTTR_TOOLS" = "true" ]; then
+    if [ ! -f "$FEED_TMP/h3c-fttr-tools/Makefile" ]; then
+      echo "::error::$FEED_TMP/h3c-fttr-tools/Makefile 不存在"
+      exit 1
+    fi
+    rm -rf "$PKG_DIR/h3c-fttr-tools"
+    cp -a "$FEED_TMP/h3c-fttr-tools" "$PKG_DIR/h3c-fttr-tools"
 
-
-  find "$PKG_DIR/h3c-fmcs-firmware/files" -type f ! -name 'FTTR_TOP.sbit' -print -delete 2>/dev/null
-  SBIT="$PKG_DIR/h3c-fmcs-firmware/files/FTTR_TOP.sbit"
-  if [ ! -f "$SBIT" ]; then
-    echo "::error::$SBIT 缺失，包 install 时会失败"
-    exit 1
+    # ⚠ Rust 包走 feeds/packages/lang/rust/rust-package.mk，需要 rust feed 与
+    #   rust/host 工具链。没有 packages feed（或没装 rust）时包索引里根本
+    #   不会出现 h3c-fttr-tools，后面硬校验会拦住。这里只提示不拦截。
+    # ⚠ 首次构建要编译整套 Rust host 工具链，耗时以小时计 —— GitHub Actions
+    #   默认 6h 上限，同一 workflow 里还编内核的话非常容易超时。
+    echo "   ⚠ h3c-fttr-tools 是 Rust 包（需 rust/host 工具链），首次编译很慢"
+    echo "✅ 已拷贝: h3c-fttr-tools (版本 $(grep -m1 '^PKG_VERSION' "$PKG_DIR/h3c-fttr-tools/Makefile" 2>/dev/null | sed 's/PKG_VERSION:=//'))"
   fi
-  SBIT_SIZE="$(stat -c%s "$SBIT")"
-  if [ "$SBIT_SIZE" -lt 1000000 ]; then
-    echo "::error::FTTR_TOP.sbit 只有 ${SBIT_SIZE} 字节（正常 2087000），文件异常"
-    exit 1
-  fi
-  echo "   FTTR_TOP.sbit: ${SBIT_SIZE} 字节 sha256=$(sha256sum "$SBIT" | cut -c1-16)…"
 
-  echo "✅ 已拷贝: h3c-fmcs-firmware"
-  rm -rf "$FMCS_TMP"
+  # --- h3c-fmcs-firmware（bitstream）---
+  if [ "$ADD_FMCS_FW" = "true" ]; then
+    if [ ! -f "$FEED_TMP/h3c-fmcs-firmware/Makefile" ]; then
+      echo "::error::$FEED_TMP/h3c-fmcs-firmware/Makefile 不存在"
+      exit 1
+    fi
+    rm -rf "$PKG_DIR/h3c-fmcs-firmware"
+    cp -a "$FEED_TMP/h3c-fmcs-firmware" "$PKG_DIR/h3c-fmcs-firmware"
+
+    # 清掉 files/ 里除 bitstream 以外的杂项（上游曾混入过一个 1 字节的同名
+    # 影子文件：文件名里藏了 U+200E 不可见字符，Windows 手工上传事故）。
+    find "$PKG_DIR/h3c-fmcs-firmware/files" -type f ! -name 'FTTR_TOP.sbit' -print -delete 2>/dev/null
+
+    SBIT="$PKG_DIR/h3c-fmcs-firmware/files/FTTR_TOP.sbit"
+    if [ ! -f "$SBIT" ]; then
+      echo "::error::$SBIT 缺失，包 install 时会失败"
+      exit 1
+    fi
+    SBIT_SIZE="$(stat -c%s "$SBIT")"
+    if [ "$SBIT_SIZE" -lt 1000000 ]; then
+      echo "::error::FTTR_TOP.sbit 只有 ${SBIT_SIZE} 字节（正常 2087000），文件异常"
+      exit 1
+    fi
+    echo "   FTTR_TOP.sbit: ${SBIT_SIZE} 字节 sha256=$(sha256sum "$SBIT" | cut -c1-16)…"
+    echo "✅ 已拷贝: h3c-fmcs-firmware"
+  fi
+
+  rm -rf "$FEED_TMP"
 fi
+
 
 # --- Airoha SoC 状态页（NPU 卸载 / CPU 频率 / Frame Engine / PPE 流表）---
 # 包名由目录名决定（luci.mk: PKG_NAME ?= $(notdir ${CURDIR})），
@@ -390,22 +484,42 @@ if [ -n "$(ls -A "$PKG_DIR" 2>/dev/null)" ]; then
   if [ "$ADD_LUCI_APP" = "true" ]; then
     REQUIRED="$REQUIRED luci-app-natmode luci-app-pon-status"
   fi
-  if [ "$ADD_FMCS_FW" = "true" ] && [ "$FTTR_PROFILE" = "h3c_hm2004-du" ]; then
-    REQUIRED="$REQUIRED h3c-fmcs-firmware"
-  fi
   if [ "$ADD_FTTR" = "true" ] && [ "$FTTR_PROFILE" = "h3c_hm2004-du" ]; then
+    # KernelPackage 生成的包名带 kmod- 前缀，索引里写的是 kmod-h3c-fmcs
+    if [ "$ADD_FMCS" = "true" ]; then
+      REQUIRED="$REQUIRED kmod-h3c-fmcs"
+    fi
+    if [ "$ADD_FMCS_FW" = "true" ]; then
+      REQUIRED="$REQUIRED h3c-fmcs-firmware"
+    fi
+    if [ "$ADD_FTTR_TOOLS" = "true" ]; then
+      REQUIRED="$REQUIRED h3c-fttr-tools"
+    fi
     REQUIRED="$REQUIRED luci-app-fttr"
     # =========================================================
-    # luci-app-fttr 的 LUCI_DEPENDS 里有 +h3c-fttr-tools（fttrctl 后端）。
-    # 这个包目前不在 ImmortalWrt feeds，也不在 pon_drivers / pon_userspace，
-    # 树里没有它，defconfig 一定把 luci-app-fttr 剔掉 —— 与其编出一个
-    # 「没有 FTTR 界面」的固件还不易察觉，不如在这里直接报错。
-    # 不需要这个界面就把上面的 ADD_FTTR 改成 false（clone 和校验一起停）。
+    # luci-app-fttr 的 LUCI_DEPENDS 里有 +h3c-fttr-tools（fttrctl 后端），
+    # 而 h3c-fttr-tools 又依赖 +kmod-h3c-fmcs。链条上任何一节不在树里，
+    # defconfig 都会静默把整条 FTTR 剔掉 —— 与其编出一个「没有 FTTR 界面」
+    # 的固件还不易察觉，不如在这里直接报错。
+    #
+    # h3c-fttr-tools 进不了索引的最常见原因是缺 Rust 支持：它 include 了
+    # feeds/packages/lang/rust/rust-package.mk，没有 packages feed（或没装
+    # rust）时这个包根本不会被扫到。kmod-h3c-fmcs 则受
+    # @(TARGET_airoha_an7581) 限制，非该 target 时同样不进索引。
     # =========================================================
-    if ! grep -qx "Package: h3c-fttr-tools" tmp/.packageinfo 2>/dev/null; then
-      echo "::error::luci-app-fttr 依赖的后端 h3c-fttr-tools 不在包索引里（fttrctl / ucode 运行时）"
-      echo "        请先把 h3c-fttr-tools 放进源码树或 feeds 再编；"
-      echo "        暂时不需要 FTTR 界面就把 diy-part1.sh 的 ADD_FTTR 改成 false。"
+    if [ "$ADD_FTTR_TOOLS" = "true" ] &&
+       ! grep -qx "Package: h3c-fttr-tools" tmp/.packageinfo 2>/dev/null; then
+      echo "::error::h3c-fttr-tools 不在包索引里（luci-app-fttr 的后端，Rust 包）"
+      echo "        多半是缺 rust feed：确认 feeds.conf 里有 packages，且"
+      echo "        ./scripts/feeds install 装到了 lang/rust。"
+      echo "        不需要 FTTR 就把 diy-part1.sh 的 ADD_FTTR 改成 false。"
+      exit 1
+    fi
+    if [ "$ADD_FMCS" = "true" ] &&
+       ! grep -qx "Package: kmod-h3c-fmcs" tmp/.packageinfo 2>/dev/null; then
+      echo "::error::kmod-h3c-fmcs 不在包索引里（h3c-fttr-tools 依赖它）"
+      echo "        DEPENDS 是 @(TARGET_airoha_an7581)：非该 target 时包不会进索引。"
+      echo "        不需要 FTTR 就把 diy-part1.sh 的 ADD_FTTR 改成 false。"
       exit 1
     fi
   fi
