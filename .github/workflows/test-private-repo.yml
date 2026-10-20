@@ -1,0 +1,156 @@
+name: Test private repo pull
+
+# 私有仓库（openwrt-fttr）拉取链路专项测试：
+# 不跑编译，只验证「匿名探测 → Secret 取令牌 → insteadOf 注入 → 真实 clone → 包结构断言」
+# 整条链路和 build-ponwrt.yml + diy-part1.sh 完全一致。
+# 用法：Actions → Test private repo pull → Run workflow（令牌不用填，走 Secret）
+
+on:
+  workflow_dispatch:
+    inputs:
+      private_repo:
+        description: '要测试拉取的仓库（owner/repo；填 none = 只验证跳过逻辑）'
+        required: false
+        default: 'qwe-qaq/openwrt-fttr'
+      private_repo_branch:
+        description: '分支名'
+        required: false
+        default: 'main'
+
+env:
+  PRIVATE_REPO: ${{ github.event.inputs.private_repo || 'qwe-qaq/openwrt-fttr' }}
+  PRIVATE_REPO_BRANCH: ${{ github.event.inputs.private_repo_branch || 'main' }}
+
+# 最小权限：只需要 checkout 本仓库
+permissions:
+  contents: read
+
+jobs:
+  test-pull:
+    name: 私有仓库拉取测试
+    runs-on: ubuntu-24.04
+    steps:
+      # 复现真实环境：checkout 会写入 http.https://github.com/.extraheader，
+      # 必须验证凭证步骤能正确清掉它，否则它会盖掉 insteadOf 注入的 PAT
+      - name: Checkout (复现真实环境的 extraheader)
+        uses: actions/checkout@v5
+
+      # =========================================================
+      # 凭证步骤：与 build-ponwrt.yml 的 Setup private repo
+      # credentials 保持逐行一致 —— 改一边记得同步另一边
+      # =========================================================
+      - name: Setup private repo credentials
+        env:
+          SEC_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          SEC_TOKEN_LEGACY: ${{ secrets.FTTR_TOKEN }}
+        run: |
+          if [ "${PRIVATE_REPO}" = "none" ]; then
+            echo "⚠ PRIVATE_REPO=none —— 跳过拉取测试"
+            exit 0
+          fi
+
+          BASE_URL="https://github.com/${PRIVATE_REPO}"
+          # 日志脱敏：URL 里的 user:token@ 一律替换成 ***@
+          sanitize() { sed -E 's#://[^@/]+@#://***@#g'; }
+
+          # 1) 先试匿名：公开仓库不需要任何凭证
+          if ERR=$(git ls-remote --exit-code --heads "$BASE_URL" \
+                     "refs/heads/${PRIVATE_REPO_BRANCH}" 2>&1); then
+            echo "✅ ${BASE_URL} 可匿名访问（公开仓库），无需凭证"
+            exit 0
+          fi
+
+          # 2) 匿名被拒才要令牌（只从 Secret 取）
+          TOKEN="${SEC_TOKEN:-${SEC_TOKEN_LEGACY}}"
+          if [ -z "$TOKEN" ]; then
+            echo "::error::仓库 ${PRIVATE_REPO} 匿名访问被拒且 Secret 里没有可用凭证：请在仓库 Settings → Secrets and variables → Actions → Repository secrets 添加 PRIVATE_REPO_TOKEN（PAT 需对该仓库有 Contents 读权限）"
+            echo "--- git 原始错误 ---"
+            printf '%s\n' "$ERR" | sanitize
+            exit 1
+          fi
+          echo "::add-mask::$TOKEN"
+
+          # checkout 注入的 github.com 通用 Authorization 头会盖掉我们的 PAT，先清掉
+          git config --global --unset-all http.https://github.com/.extraheader 2>/dev/null || true
+
+          # 只给这一条 URL 注入凭证，其它 clone 不受影响
+          for suffix in "" ".git"; do
+            git config --global \
+              "url.https://x-access-token:${TOKEN}@github.com/${PRIVATE_REPO}${suffix}.insteadOf" \
+              "$BASE_URL${suffix}"
+          done
+
+          # 3) 带凭证复检：失败时打印脱敏后的真实错误，别只给一句黑盒提示
+          if ERR=$(git ls-remote --exit-code --heads "$BASE_URL" \
+                     "refs/heads/${PRIVATE_REPO_BRANCH}" 2>&1); then
+            echo "✅ 凭证已注入并验证通过：${BASE_URL} (分支 ${PRIVATE_REPO_BRANCH})"
+          else
+            echo "::error::仓库 ${PRIVATE_REPO} 的分支 ${PRIVATE_REPO_BRANCH} 带凭证访问失败"
+            echo "--- git 原始错误（已脱敏）---"
+            printf '%s\n' "$ERR" | sanitize
+            echo "常见原因：PAT 无效/已吊销、对该仓库无读权限（fine-grained 必须 Repository access 选中该仓库且 Permissions → Contents: Read-only，只勾默认的 Metadata 读不了 git；个人账号没有 SSO 这回事，只有组织仓库且组织开了 SAML SSO 才需要授权 PAT）、分支名不正确"
+            exit 1
+          fi
+
+      # =========================================================
+      # 真实 clone：命令与 diy-part1.sh 的 clone() 完全一致
+      # （git clone --depth 1 -b <branch> <裸URL>），URL 里不拼 token，
+      # 靠上一步的 insteadOf 生效 —— 这一步过不了，编译时也一定挂
+      # =========================================================
+      - name: Clone test (与 diy-part1.sh 相同的命令)
+        run: |
+          set -euo pipefail
+          if [ "${PRIVATE_REPO}" = "none" ]; then
+            echo "⚠ PRIVATE_REPO=none —— 跳过 clone 测试"
+            exit 0
+          fi
+
+          DEST="$RUNNER_TEMP/openwrt-fttr"
+          rm -rf "$DEST"
+
+          echo "=== git clone --depth 1 -b ${PRIVATE_REPO_BRANCH} https://github.com/${PRIVATE_REPO} ==="
+          git clone --depth 1 -b "${PRIVATE_REPO_BRANCH}" \
+            "https://github.com/${PRIVATE_REPO}" "$DEST"
+
+          echo
+          echo "✅ clone 成功，最近提交："
+          git -C "$DEST" log -1 --format='  %H  %ad  %an  %s' --date=iso
+          echo
+          echo "=== 顶层内容（feed 形态：根目录直接是包目录，没有 package/ 子目录）==="
+          ls -A "$DEST"
+
+          echo
+          echo "=== diy-part1.sh 同款断言：包目录 + Makefile 存在 ==="
+          FAIL=0
+          for p in h3c-fmcs h3c-fttr-tools h3c-fmcs-firmware; do
+            if [ -f "$DEST/$p/Makefile" ]; then
+              V=$(grep -m1 '^PKG_VERSION' "$DEST/$p/Makefile" 2>/dev/null \
+                    | sed 's/PKG_VERSION:=//' | tr -d ' \r')
+              echo "  ✅ $p  (PKG_VERSION=${V:-未找到})"
+            else
+              echo "  ❌ 缺少 $DEST/$p/Makefile（上游改结构了？）"
+              FAIL=1
+            fi
+          done
+
+          # h3c-fmcs-firmware 里应是 2MB 左右的实文件（不是 Git LFS 指针）
+          SBIT=$(find "$DEST/h3c-fmcs-firmware" -name '*.sbit' 2>/dev/null | head -1)
+          if [ -n "$SBIT" ]; then
+            SZ=$(du -h "$SBIT" | cut -f1)
+            echo "  ℹ FPGA 比特流: ${SBIT#$DEST/} ($SZ)"
+            if head -c 200 "$SBIT" | grep -q 'git-lfs'; then
+              echo "  ⚠ 看起来是 Git LFS 指针而不是实文件，runner 上需要先装 git-lfs"
+            fi
+          else
+            echo "  ⚠ 未找到 .sbit 文件（结构可能变了，留意一下）"
+          fi
+
+          if [ "$FAIL" -ne 0 ]; then
+            echo "::error::包结构断言失败 —— clone 能过但内容不对，编译时包会被 defconfig 剔除"
+            exit 1
+          fi
+
+          echo
+          echo "=========================================="
+          echo "✅ 私有仓库拉取测试全部通过"
+          echo "=========================================="

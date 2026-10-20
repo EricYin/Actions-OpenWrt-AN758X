@@ -278,9 +278,27 @@ Actions → Repository secrets，名字必须一字不差叫 `PRIVATE_REPO_TOKEN
   （那个头带的是**本仓库**的 GITHUB_TOKEN，对私有仓库无效，还会盖掉 insteadOf 的凭证）；
 - 复检失败时打印脱敏后的 git 原始错误，而不是一句黑盒提示。
 
-> ⚠️ Run workflow 的输入值对能触发本 workflow 的人可见，并随运行记录留存 ——
-> 长期凭证请放仓库 Secret（Settings → Secrets and variables → Actions 添加
-> `PRIVATE_REPO_TOKEN`），运行输入只当临时覆盖用。组织仓库记得给 PAT 授权 SSO。
+> ⚠️ 凭证只放仓库 Secret（Settings → Secrets and variables → Actions 添加
+> `PRIVATE_REPO_TOKEN`），Run workflow 表单不提供令牌输入框 —— 输入值对能触发本
+> workflow 的人可见并随运行记录留存，不安全。SSO 授权只有组织仓库且组织开了
+> SAML SSO 才需要（个人账号没这回事）：令牌建好后在 Settings → Developer settings →
+> Personal access tokens 里点令牌旁的 "Configure SSO" → "Authorize"。
+
+### 专项测试：Test private repo pull
+
+不想跑整轮编译来验证凭证？用 **Actions → Test private repo pull → Run workflow**
+（令牌同样不用填，走 Secret）。它不编译，只把拉取链路完整走一遍：
+
+1. `actions/checkout` 本仓库 —— 复现真实环境里 `extraheader` 会盖掉 PAT 的坑；
+2. 与 build-ponwrt.yml **逐行相同**的凭证步骤（匿名探测 → Secret 取令牌 →
+   insteadOf 注入 → 带凭证 ls-remote 复检，失败打印脱敏原始错误）；
+3. 用与 diy-part1.sh **完全相同的命令**真实 clone（`git clone --depth 1 -b <分支> <裸URL>`），
+   并做 diy-part1.sh 同款断言：三个包目录 + Makefile 必须存在、打印各包 PKG_VERSION、
+   检查 FPGA 比特流是实文件而不是 Git LFS 指针。
+
+全过 = 凭证和仓库结构都没问题，可以直接去跑正式编译；任何一步挂，日志里就是原因
+（PAT 没 Contents 权限 / 分支名错 / 上游改了目录结构）。改凭证逻辑时记得
+**两个 workflow 同步改**（build-ponwrt.yml 和 test-private-repo.yml）。
 
 ## 仓库设置：Actions 权限（必看）
 
