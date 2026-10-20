@@ -175,9 +175,16 @@ jobs:
           FAIL=0
           for p in h3c-fmcs h3c-fttr-tools h3c-fmcs-firmware; do
             if [ -f "$DEST/$p/Makefile" ]; then
+              # ⚠ grep 无匹配会退出 1，pipefail+set -e 会因此杀掉整个步骤，
+              #   必须 || true 兜底（h3c-fmcs 是 KernelPackage，本来就没有
+              #   PKG_VERSION 行，只有 PKG_RELEASE，属于正常现象）
               V=$(grep -m1 '^PKG_VERSION' "$DEST/$p/Makefile" 2>/dev/null \
-                    | sed 's/PKG_VERSION:=//' | tr -d ' \r')
-              echo "  ✅ $p  (PKG_VERSION=${V:-未找到})"
+                    | sed 's/PKG_VERSION:=//' | tr -d ' \r' || true)
+              if [ -n "$V" ]; then
+                echo "  ✅ $p  (PKG_VERSION=$V)"
+              else
+                echo "  ✅ $p  (无 PKG_VERSION 行 —— KernelPackage 正常，只有 PKG_RELEASE)"
+              fi
             else
               echo "  ❌ 缺少 $DEST/$p/Makefile（上游改结构了？）"
               FAIL=1
