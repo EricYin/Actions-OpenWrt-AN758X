@@ -8,7 +8,8 @@ env:
   BUILD_ROOT: /workdir
   SOURCE: ${{ github.event.inputs.source || 'fork' }}
   # 唯一真相源：固件版本后缀的作者名（LuCI 概览页「固件版本」）
-  FW_AUTHOR: 'qwe'
+  # 由 fw_author 输入项覆盖，留空则 qwe
+  FW_AUTHOR: ${{ github.event.inputs.fw_author || 'qwe' }}
   REPO_URL: ${{ github.event.inputs.source == 'pbs05/ponwrt' && 'https://github.com/pbs05/ponwrt' || 'https://github.com/qwe3017/ponwrt' }}
   FEEDS_CONF: ''
   DIY_P1_SH: diy-part1.sh
@@ -254,11 +255,12 @@ jobs:
           cd openwrt && echo "commit: $(git rev-parse --short HEAD)"
 
       # =========================================================
-      # 2.5 私有仓库凭证（运行时输入 PAT，或使用仓库 Secret）
+      # 2.5 仓库凭证（openwrt-fttr feed 的来源）
       #
-      # 背景：openwrt-fttr 是私有仓库，diy-part1.sh 里裸 clone 会 401 失败并
-      # exit 1。这里把凭证写进 git 配置（insteadOf），diy-part1.sh 的 clone
-      # URL 保持原样即可，token 既不会出现在命令行，也不会被 echo 进日志。
+      # 流程：先试匿名访问 —— 仓库已转公开时（qwe-qaq/openwrt-fttr 当前
+      # 就是公开的）零凭证直接过；匿名被拒才要求令牌，用 git insteadOf
+      # 注入，diy-part1.sh 的 clone URL 保持原样，token 既不会出现在
+      # 命令行，也不会被 echo 进日志（另有 add-mask 双保险）。
       #
       # 凭证优先级：运行时输入 private_repo_token
       #              > secrets.PRIVATE_REPO_TOKEN > secrets.FTTR_TOKEN
@@ -279,9 +281,23 @@ jobs:
             exit 0
           fi
 
+          BASE_URL="https://github.com/${PRIVATE_REPO}"
+          # 日志脱敏：URL 里的 user:token@ 一律替换成 ***@
+          sanitize() { sed -E 's#://[^@/]+@#://***@#g'; }
+
+          # 1) 先试匿名：公开仓库不需要任何凭证
+          if ERR=$(git ls-remote --exit-code --heads "$BASE_URL" \
+                     "refs/heads/${PRIVATE_REPO_BRANCH}" 2>&1); then
+            echo "✅ ${BASE_URL} 可匿名访问（公开仓库），无需凭证"
+            exit 0
+          fi
+
+          # 2) 匿名被拒才要令牌
           TOKEN="${IN_TOKEN:-${SEC_TOKEN:-${SEC_TOKEN_LEGACY}}}"
           if [ -z "$TOKEN" ]; then
-            echo "::error::缺少私有仓库凭证：请在本页填 private_repo_token，或在仓库 Settings → Secrets and variables → Actions 添加 PRIVATE_REPO_TOKEN（PAT 需有 repo 读权限；组织仓库还要授权 SSO）"
+            echo "::error::仓库 ${PRIVATE_REPO} 匿名访问被拒且未提供凭证：请在本页填 private_repo_token，或在仓库 Settings → Secrets and variables → Actions 添加 PRIVATE_REPO_TOKEN（PAT 需有 repo 读权限；组织仓库还要授权 SSO）"
+            echo "--- git 原始错误 ---"
+            printf '%s\n' "$ERR" | sanitize
             exit 1
           fi
           echo "::add-mask::$TOKEN"
@@ -294,17 +310,20 @@ jobs:
           for suffix in "" ".git"; do
             git config --global \
               "url.https://x-access-token:${TOKEN}@github.com/${PRIVATE_REPO}${suffix}.insteadOf" \
-              "https://github.com/${PRIVATE_REPO}${suffix}"
+              "$BASE_URL${suffix}"
           done
 
-          # 提前自检：凭证无效 / 分支不存在就在这里失败，别等到 diy-part1.sh
-          if ! git ls-remote --exit-code --heads \
-               "https://github.com/${PRIVATE_REPO}" "refs/heads/${PRIVATE_REPO_BRANCH}" >/dev/null 2>&1; then
-            echo "::error::私有仓库 ${PRIVATE_REPO} 的分支 ${PRIVATE_REPO_BRANCH} 访问失败：检查 PAT 是否有效、对该仓库是否有读权限（组织仓库需 SSO 授权）、分支名是否正确"
+          # 3) 带凭证复检：失败时打印脱敏后的真实错误，别只给一句黑盒提示
+          if ERR=$(git ls-remote --exit-code --heads "$BASE_URL" \
+                     "refs/heads/${PRIVATE_REPO_BRANCH}" 2>&1); then
+            echo "✅ 凭证已注入并验证通过：${BASE_URL} (分支 ${PRIVATE_REPO_BRANCH})"
+          else
+            echo "::error::仓库 ${PRIVATE_REPO} 的分支 ${PRIVATE_REPO_BRANCH} 带凭证访问失败"
+            echo "--- git 原始错误（已脱敏）---"
+            printf '%s\n' "$ERR" | sanitize
+            echo "常见原因：PAT 无效/过期、对该仓库无读权限（组织仓库需 SSO 授权）、分支名不正确、令牌在输入框里被带入了多余字符（空格/换行）"
             exit 1
           fi
-
-          echo "✅ 凭证已注入：https://github.com/${PRIVATE_REPO} (分支 ${PRIVATE_REPO_BRANCH})"
 
       # =========================================================
       # 3. dl 下载缓存
@@ -734,11 +753,13 @@ jobs:
       # =========================================================
       - name: SSH connection to Actions
         uses: mxschmitt/action-tmate@v3
+        # 原条件 contains(github.event.action, 'ssh') 对 workflow_dispatch 永假
+        # （event.action 恒为 "workflow_dispatch"），叠加 ref==refs/heads/main
+        # （本 workflow 在 FTTR 分支运行）后，ssh=true 从来不会触发。
+        # 保留 owner 校验：调试入口只对仓库所有者开放。
         if: >-
-          (github.event.inputs.ssh == 'true' && github.event.inputs.ssh != 'false')
-          && github.ref == 'refs/heads/main'
+          github.event.inputs.ssh == 'true'
           && github.actor == github.repository_owner
-          && contains(github.event.action, 'ssh')
 
       # =========================================================
       # 17. 下载软件包（defconfig 已在步骤 9 执行，此处不再重复）

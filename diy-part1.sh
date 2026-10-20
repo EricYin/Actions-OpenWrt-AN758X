@@ -127,8 +127,8 @@ if [ "$ADD_FTTR" = "true" ] && [ "$FTTR_PROFILE" = "h3c_hm2004-du" ]; then
   FTTR_FEED_BRANCH="${PRIVATE_REPO_BRANCH:-main}"
   FTTR_FEED_TMP="$(mktemp -d)/openwrt-fttr"
   if ! clone "$FTTR_FEED_URL" "$FTTR_FEED_TMP" "$FTTR_FEED_BRANCH"; then
-    echo "::error::openwrt-fttr 拉取失败（私有仓库需要凭证：检查 PAT 有效期、repo 读权限、组织 SSO 授权）"
-    echo "        kmod-h3c-fmcs / h3c-fttr-tools / h3c-fmcs-firmware 会被 defconfig 剔除"
+    echo "::error::openwrt-fttr 拉取失败：${FTTR_REPO} (分支 ${FTTR_BRANCH})，kmod-h3c-fmcs / h3c-fttr-tools / h3c-fmcs-firmware 会被 defconfig 剔除"
+    echo "        公开仓库失败=仓库/分支名不对；私有仓库缺凭证=检查 Run workflow 的 private_repo_token 或仓库 Secret PRIVATE_REPO_TOKEN"
     exit 1
   fi
 
