@@ -38,11 +38,13 @@ ADD_OAF=false          # luci-app-oaf（应用过滤，含内核模块，高风�
 ADD_LUCI_APP=true       # qwe3017/luci-app 仓库（monorepo）
                         #   ├─ luci-app-natmode     NAT 类型三选一（网络 → NAT 类型）
                         #   └─ luci-app-pon-status  PON 光模块卡片（概览页「系统」下一格）
-ADD_FTTR=true           # FTTR 全家桶总开关（下面的子开关都受它管）★仅 HM2004-DU
-ADD_FMCS=true           # h3c-fmcs：Micro-OLT FPGA 内核驱动（kmod-h3c-fmcs）
-ADD_FTTR_TOOLS=true     # h3c-fttr-tools：fttrd 控制器 + fttrctl（Rust 包）
-ADD_FMCS_FW=true        # h3c-fmcs-firmware：FPGA 比特流 FTTR_TOP.sbit
-                        # （以上三个都来自 openwrt-fttr feed，bitstream 由驱动加载）
+# 下面这几个开关都能被环境变量覆盖（: ${VAR:=默认} 的写法）：
+# workflow 里选了「不拉私有仓库」时会注入 ADD_FTTR=false，整段直接跳过。
+: "${ADD_FTTR:=true}"       # FTTR 全家桶总开关（下面的子开关都受它管）★仅 HM2004-DU
+: "${ADD_FMCS:=true}"       # h3c-fmcs：Micro-OLT FPGA 内核驱动（kmod-h3c-fmcs）
+: "${ADD_FTTR_TOOLS:=true}" # h3c-fttr-tools：fttrd 控制器 + fttrctl（Rust 包）
+: "${ADD_FMCS_FW:=true}"    # h3c-fmcs-firmware：FPGA 比特流 FTTR_TOP.sbit
+                            # （以上三个都来自 openwrt-fttr 私有仓库，bitstream 由驱动加载）
 
 # 这四个包只对 HM2004-DU 有意义：驱动按 @(TARGET_airoha_an7581) 限定了
 # target，界面和后端都围着重型 FTTR 主从设备转。workflow 会把 PROFILE
@@ -96,7 +98,10 @@ fi
 # =========================================================
 # h3c-fmcs / h3c-fttr-tools / h3c-fmcs-firmware —— FTTR 后端三件套 ★HM2004-DU 专属
 #
-# 源：LazuliKao/openwrt-fttr
+# 源：qwe-qaq/openwrt-fttr（私有仓库）
+#   凭证由 workflow 用 git insteadOf 注入（见 build-ponwrt.yml 的
+#   Setup private repo credentials 步骤），所以这里照旧用「裸 URL」——
+#   千万别在这里拼 token，clone 的 echo 会把它打进日志。
 #   ⚠ 这个仓库是 feed 形态：根目录直接就是三个包目录，没有 package/ 子目录，
 #     也没有顶层 Makefile。所以按目录名直接拷进 package/custom/ 即可 ——
 #     目录名必须等于包名（package.mk: PKG_NAME ?= $(notdir ${CURDIR})），
@@ -117,9 +122,13 @@ fi
 #   不受影响 —— 看到 ❌ 不用慌。
 # =========================================================
 if [ "$ADD_FTTR" = "true" ] && [ "$FTTR_PROFILE" = "h3c_hm2004-du" ]; then
+  # 仓库与分支由 workflow 注入，本地手工跑时回退到下面的默认值
+  FTTR_FEED_URL="https://github.com/${PRIVATE_REPO:-qwe-qaq/openwrt-fttr}"
+  FTTR_FEED_BRANCH="${PRIVATE_REPO_BRANCH:-main}"
   FTTR_FEED_TMP="$(mktemp -d)/openwrt-fttr"
-  if ! clone https://github.com/qwe-qaq/openwrt-fttr "$FTTR_FEED_TMP" main; then
-    echo "::error::openwrt-fttr 拉取失败，kmod-h3c-fmcs / h3c-fttr-tools / h3c-fmcs-firmware 会被 defconfig 剔除"
+  if ! clone "$FTTR_FEED_URL" "$FTTR_FEED_TMP" "$FTTR_FEED_BRANCH"; then
+    echo "::error::openwrt-fttr 拉取失败（私有仓库需要凭证：检查 PAT 有效期、repo 读权限、组织 SSO 授权）"
+    echo "        kmod-h3c-fmcs / h3c-fttr-tools / h3c-fmcs-firmware 会被 defconfig 剔除"
     exit 1
   fi
 
