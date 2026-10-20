@@ -94,6 +94,62 @@ if [ "$ADD_LUCI_APP" = "true" ]; then
 fi
 
 # =========================================================
+# h3c-fmcs / h3c-fttr-tools / h3c-fmcs-firmware —— FTTR 后端三件套 ★HM2004-DU 专属
+#
+# 源：LazuliKao/openwrt-fttr
+#   ⚠ 这个仓库是 feed 形态：根目录直接就是三个包目录，没有 package/ 子目录，
+#     也没有顶层 Makefile。所以按目录名直接拷进 package/custom/ 即可 ——
+#     目录名必须等于包名（package.mk: PKG_NAME ?= $(notdir ${CURDIR})），
+#     否则 config 里的 CONFIG_PACKAGE_xxx 符号对不上。
+#
+#   h3c-fmcs           KernelPackage，索引里的名字带 kmod- 前缀 → kmod-h3c-fmcs
+#                      DEPENDS 含 @(TARGET_airoha_an7581)，非 an7581 不进索引
+#                      另依赖 +kmod-spi-gpio
+#   h3c-fttr-tools     Rust 包，硬 include $(TOPDIR)/feeds/packages/lang/rust/rust-package.mk
+#                      DEPENDS: +kmod-h3c-fmcs +mosquitto-client +mosquitto-ssl
+#                               +uci +ubus +firewall4 +dnsmasq
+#   h3c-fmcs-firmware  纯数据包，FPGA 比特流 → /lib/firmware/FTTR_TOP.sbit
+#                      （仓库内是实文件 2.0MB，不是 Git LFS 指针，可直接 clone 拿到）
+#
+# ⚠ 下面索引校验循环里 h3c-fmcs 这一行会显示 ❌：循环按「目录名」查，
+#   而 KernelPackage 在 tmp/.packageinfo 里记的是 kmod-h3c-fmcs。
+#   INDEX_MISS 只会产生 ::warning::，真正的硬校验在后面按 kmod-h3c-fmcs 查，
+#   不受影响 —— 看到 ❌ 不用慌。
+# =========================================================
+if [ "$ADD_FTTR" = "true" ] && [ "$FTTR_PROFILE" = "h3c_hm2004-du" ]; then
+  FTTR_FEED_TMP="$(mktemp -d)/openwrt-fttr"
+  if ! clone https://github.com/LazuliKao/openwrt-fttr "$FTTR_FEED_TMP" main; then
+    echo "::error::openwrt-fttr 拉取失败，kmod-h3c-fmcs / h3c-fttr-tools / h3c-fmcs-firmware 会被 defconfig 剔除"
+    exit 1
+  fi
+
+  # h3c-fttr-tools 硬 include 了 feeds/packages/lang/rust/rust-package.mk，
+  # 这个文件不在的话 dump 直接失败、包静默不进索引。
+  # 与其等到 defconfig 把它剔掉才发现，不如在这里就报错退出。
+  if [ "$ADD_FTTR_TOOLS" = "true" ] && [ ! -f feeds/packages/lang/rust/rust-package.mk ]; then
+    echo "::error::未找到 feeds/packages/lang/rust/rust-package.mk，h3c-fttr-tools 无法索引"
+    echo "        确认 packages feed 已 update + install；或把 ADD_FTTR_TOOLS 置为 false"
+    exit 1
+  fi
+
+  FTTR_FEED_PKGS=""
+  [ "$ADD_FMCS" = "true" ]       && FTTR_FEED_PKGS="$FTTR_FEED_PKGS h3c-fmcs"
+  [ "$ADD_FTTR_TOOLS" = "true" ] && FTTR_FEED_PKGS="$FTTR_FEED_PKGS h3c-fttr-tools"
+  [ "$ADD_FMCS_FW" = "true" ]    && FTTR_FEED_PKGS="$FTTR_FEED_PKGS h3c-fmcs-firmware"
+
+  for p in $FTTR_FEED_PKGS; do
+    if [ ! -f "$FTTR_FEED_TMP/$p/Makefile" ]; then
+      echo "::error::$FTTR_FEED_TMP/$p/Makefile 不存在（上游改结构了？）"
+      exit 1
+    fi
+    rm -rf "$PKG_DIR/$p"
+    cp -a "$FTTR_FEED_TMP/$p" "$PKG_DIR/$p"
+    echo "✅ 已拷贝: $p  (版本 $(grep -m1 '^PKG_VERSION' "$PKG_DIR/$p/Makefile" 2>/dev/null | sed 's/PKG_VERSION:=//'))"
+  done
+  rm -rf "$FTTR_FEED_TMP"
+fi
+
+# =========================================================
 # luci-app-fttr —— FTTR 管理界面（网络 → FTTR）★HM2004-DU 专属
 #
 # 源：LazuliKao/luci-app-fttr（monorepo，包在 package/luci-app-fttr/ 子目录）
@@ -409,4 +465,4 @@ if [ -n "$(ls -A "$PKG_DIR" 2>/dev/null)" ]; then
 else
   echo "未启用任何第三方插件"
 fi
-echo "🎉 diy-part1.sh 执行完毕" 
+echo "🎉 diy-part1.sh 执行完毕"
