@@ -321,7 +321,7 @@ jobs:
             echo "::error::仓库 ${PRIVATE_REPO} 的分支 ${PRIVATE_REPO_BRANCH} 带凭证访问失败"
             echo "--- git 原始错误（已脱敏）---"
             printf '%s\n' "$ERR" | sanitize
-            echo "常见原因：PAT 无效/过期、对该仓库无读权限（组织仓库需 SSO 授权）、分支名不正确、令牌在输入框里被带入了多余字符（空格/换行）"
+            echo "常见原因：PAT 无效/已吊销、对该仓库无读权限（fine-grained 必须 Repository access 选中该仓库且 Permissions → Contents: Read-only，只勾默认的 Metadata 读不了 git；组织仓库还要 SSO 授权）、分支名不正确、令牌带入多余字符（空格/换行）"
             exit 1
           fi
 

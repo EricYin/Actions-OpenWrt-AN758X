@@ -255,9 +255,9 @@ Run workflow 表单提供三个输入项：
 
 | 输入项 | 默认 | 说明 |
 |--------|------|------|
-| `private_repo` | `qwe-qaq/openwrt-fttr` | feed 仓库（当前公开）；选 `none` = 本次不拉，FTTR 相关包整体跳过 |
+| `private_repo` | `qwe-qaq/openwrt-fttr` | feed 仓库（**私有**，必须配令牌）；选 `none` = 本次不拉，FTTR 相关包整体跳过 |
 | `private_repo_branch` | `main` | 分支名 |
-| `private_repo_token` | 空 | 该仓库的读取 PAT（**仅转私有时才需要**；classic 勾 `repo`，或 fine-grained 单仓库只读） |
+| `private_repo_token` | 空 | 该仓库的读取 PAT；classic 勾 `repo`；fine-grained 需 Repository access 选中该仓库 + Permissions → **Contents: Read-only**（默认只有 Metadata 读权限，git 拉取会报 Repository not found） |
 
 凭证优先级：**运行输入 `private_repo_token` > Secret `PRIVATE_REPO_TOKEN` > Secret `FTTR_TOKEN`**。
 三者都空且仓库确实需要凭证时，步骤会报错退出并附带 git 的原始错误（已脱敏），不会白跑一轮编译。
