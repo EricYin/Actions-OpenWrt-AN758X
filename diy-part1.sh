@@ -175,7 +175,7 @@ fi
 # =========================================================
 if [ "$ADD_FTTR" = "true" ] && [ "$FTTR_PROFILE" = "h3c_hm2004-du" ]; then
   FTTR_TMP="$(mktemp -d)/fttr"
-  if ! clone https://github.com/qwe-qaq/luci-app-fttr "$FTTR_TMP" main; then
+  if ! clone https://github.com/LazuliKao/luci-app-fttr "$FTTR_TMP" main; then
     echo "::error::luci-app-fttr 拉取失败，config 里的 =y 会被 defconfig 剔除"
     exit 1
   fi
