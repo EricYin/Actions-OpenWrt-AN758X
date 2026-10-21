@@ -38,11 +38,13 @@ ADD_OAF=false          # luci-app-oaf（应用过滤，含内核模块，高风�
 ADD_LUCI_APP=true       # qwe3017/luci-app 仓库（monorepo）
                         #   ├─ luci-app-natmode     NAT 类型三选一（网络 → NAT 类型）
                         #   └─ luci-app-pon-status  PON 光模块卡片（概览页「系统」下一格）
-ADD_FTTR=true           # FTTR 全家桶总开关（下面的子开关都受它管）★仅 HM2004-DU
-ADD_FMCS=true           # h3c-fmcs：Micro-OLT FPGA 内核驱动（kmod-h3c-fmcs）
-ADD_FTTR_TOOLS=true     # h3c-fttr-tools：fttrd 控制器 + fttrctl（Rust 包）
-ADD_FMCS_FW=true        # h3c-fmcs-firmware：FPGA 比特流 FTTR_TOP.sbit
-                        # （以上三个都来自 openwrt-fttr feed，bitstream 由驱动加载）
+# 下面这几个开关都能被环境变量覆盖（: ${VAR:=默认} 的写法）：
+# workflow 里选了「不拉私有仓库」时会注入 ADD_FTTR=false，整段直接跳过。
+: "${ADD_FTTR:=true}"       # FTTR 全家桶总开关（下面的子开关都受它管）★仅 HM2004-DU
+: "${ADD_FMCS:=true}"       # h3c-fmcs：Micro-OLT FPGA 内核驱动（kmod-h3c-fmcs）
+: "${ADD_FTTR_TOOLS:=true}" # h3c-fttr-tools：fttrd 控制器 + fttrctl（Rust 包）
+: "${ADD_FMCS_FW:=true}"    # h3c-fmcs-firmware：FPGA 比特流 FTTR_TOP.sbit
+                            # （以上三个都来自 openwrt-fttr 私有仓库，bitstream 由驱动加载）
 
 # 这四个包只对 HM2004-DU 有意义：驱动按 @(TARGET_airoha_an7581) 限定了
 # target，界面和后端都围着重型 FTTR 主从设备转。workflow 会把 PROFILE
@@ -96,7 +98,12 @@ fi
 # =========================================================
 # h3c-fmcs / h3c-fttr-tools / h3c-fmcs-firmware —— FTTR 后端三件套 ★HM2004-DU 专属
 #
-# 源：LazuliKao/openwrt-fttr
+# 源：qwe-qaq/openwrt-fttr（私有仓库）
+#   凭证由 workflow 用 GIT_ASKPASS 注入（见 build-ponwrt.yml 的
+#   Create private source token / Prepare private Git authentication /
+#   Setup private repo credentials 三步）：git 被要求认证时才回调
+#   scripts/git_askpass.sh 取令牌，所以这里照旧用「裸 URL」——
+#   千万别在这里拼 token，clone 的 echo 会把它打进日志。
 #   ⚠ 这个仓库是 feed 形态：根目录直接就是三个包目录，没有 package/ 子目录，
 #     也没有顶层 Makefile。所以按目录名直接拷进 package/custom/ 即可 ——
 #     目录名必须等于包名（package.mk: PKG_NAME ?= $(notdir ${CURDIR})），
@@ -117,9 +124,13 @@ fi
 #   不受影响 —— 看到 ❌ 不用慌。
 # =========================================================
 if [ "$ADD_FTTR" = "true" ] && [ "$FTTR_PROFILE" = "h3c_hm2004-du" ]; then
+  # 仓库与分支由 workflow 注入，本地手工跑时回退到下面的默认值
+  FTTR_FEED_URL="https://github.com/${PRIVATE_REPO:-qwe-qaq/openwrt-fttr}"
+  FTTR_FEED_BRANCH="${PRIVATE_REPO_BRANCH:-main}"
   FTTR_FEED_TMP="$(mktemp -d)/openwrt-fttr"
-  if ! clone https://github.com/qwe-qaq/openwrt-fttr "$FTTR_FEED_TMP" main; then
-    echo "::error::openwrt-fttr 拉取失败，kmod-h3c-fmcs / h3c-fttr-tools / h3c-fmcs-firmware 会被 defconfig 剔除"
+  if ! clone "$FTTR_FEED_URL" "$FTTR_FEED_TMP" "$FTTR_FEED_BRANCH"; then
+    echo "::error::openwrt-fttr 拉取失败：${FTTR_REPO} (分支 ${FTTR_BRANCH})，kmod-h3c-fmcs / h3c-fttr-tools / h3c-fmcs-firmware 会被 defconfig 剔除"
+    echo "        公开仓库失败=仓库/分支名不对；私有仓库缺凭证=优先查 GitHub App（PRIVATE_SOURCE_APP_ID / PRIVATE_SOURCE_APP_PRIVATE_KEY，App 要装到该仓库且 Contents: Read-only），回退才看 Secret PRIVATE_REPO_TOKEN 是否有效（PAT 需对该仓库有 Contents 读权限）"
     exit 1
   fi
 
@@ -164,7 +175,7 @@ fi
 # =========================================================
 if [ "$ADD_FTTR" = "true" ] && [ "$FTTR_PROFILE" = "h3c_hm2004-du" ]; then
   FTTR_TMP="$(mktemp -d)/fttr"
-  if ! clone https://github.com/LazuliKao/luci-app-fttr "$FTTR_TMP" main; then
+  if ! clone https://github.com/qwe-qaq/luci-app-fttr "$FTTR_TMP" main; then
     echo "::error::luci-app-fttr 拉取失败，config 里的 =y 会被 defconfig 剔除"
     exit 1
   fi
@@ -328,6 +339,60 @@ for p in luci-app-natmode luci-app-pon-status; do
     exit 1
   fi
 done
+# ---------------------------------------------------------
+# 补回 libffi —— python3(3.14) 的 _ctypes 硬性需要
+#
+# 背景（2026-10-20 实测）：
+#   1) CPython 自 3.11 起删除了 --with-system-ffi 选项，官方措辞是
+#      "libffi must now always be supplied by the system on all
+#      non-Windows platforms"。也就是说不管传不传这个参数，
+#      _ctypes 都会 #include <ffi.h>。
+#   2) 但 ponwrt 源码树的 package/libs/libffi/Makefile 不存在
+#      （pbs05/ponwrt 与 qwe3017/ponwrt 都是 404），
+#      packages feed 里也早已迁走（immortalwrt/packages 的
+#      libs/libffi 同样是 404）。结果整棵树没有 libffi：
+#      编译日志里一行 libffi 都没有，staging_dir 下没有
+#      ffi.h / libffi.pc。
+#   3) python3 的 Makefile 还只给 HOST_BUILD_DEPENDS 写了 libffi/host，
+#      target 侧 python3-light 的 DEPENDS 里没有 +libffi，
+#      python3-ctypes 子包才有 —— 依赖指向不存在的包会被 defconfig
+#      静默丢弃，python3 照样进编译列表，编到 _ctypes.c 才炸：
+#        ./Modules/_ctypes/_ctypes.c:119:10: fatal error: ffi.h:
+#        No such file or directory
+#      → make[5] Error 1 → package/feeds/packages/python3 failed to build
+#        → world Error 2
+#
+# 处理：从 immortalwrt 基座取现成的包定义（3.4.7，自带 Build/InstallDev，
+#       会把 ffi.h / ffitarget.h / fficonfig.h / libffi.pc 装进
+#       staging_dir/target-*/usr/{include,lib/pkgconfig}），
+#       再给 python3 补一条 target 侧构建依赖保证编译顺序。
+#
+# ⚠ 必须放在 prepare-tmpinfo 之前：目录要被扫进索引，
+#    PKG_BUILD_DEPENDS 也要在 tmpinfo 里生效。
+# ---------------------------------------------------------
+FFI_DIR="package/custom/libffi"
+if [ ! -d "$FFI_DIR" ]; then
+  echo "--- 补回 libffi（python3 _ctypes 依赖，源码树中缺失）---"
+  mkdir -p "$FFI_DIR"
+  if curl -fsSL --retry 3 --max-time 60 \
+       https://raw.githubusercontent.com/immortalwrt/immortalwrt/master/package/libs/libffi/Makefile \
+       -o "$FFI_DIR/Makefile"; then
+    echo "✅ 已补回 libffi ($(grep -m1 '^PKG_VERSION' "$FFI_DIR/Makefile" 2>/dev/null))"
+  else
+    echo "::error::libffi 包定义下载失败 —— python3 的 _ctypes 会因缺 ffi.h 编译失败"
+    rm -rf "$FFI_DIR"
+  fi
+else
+  echo "已存在，跳过: $FFI_DIR"
+fi
+
+# python3 只声明了 libffi/host，target 侧没声明，补一条确保 libffi 先编译
+PY3MK="feeds/packages/lang/python/python3/Makefile"
+if [ -f "$PY3MK" ] && ! grep -q 'PKG_BUILD_DEPENDS:=bluez libffi' "$PY3MK"; then
+  sed -i 's|^PKG_BUILD_DEPENDS:=bluez|PKG_BUILD_DEPENDS:=bluez libffi|' "$PY3MK"
+  echo "✅ python3 已补 libffi 构建依赖（PKG_BUILD_DEPENDS，保证先编 libffi）"
+fi
+
 # ---------------------------------------------------------
 # 清理重复嵌套目录
 # rchen14b/luci-app-airoha-npu 这个仓库有问题：包在根目录放了一份，
