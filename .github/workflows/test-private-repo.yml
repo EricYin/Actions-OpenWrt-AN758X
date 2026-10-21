@@ -208,7 +208,21 @@ jobs:
           TOKEN_FILE="$RUNNER_TEMP/gh_token"
           printf '%s' "$TOKEN" > "$TOKEN_FILE"
           chmod 600 "$TOKEN_FILE"
+
+          # ⚠ 写 $GITHUB_ENV 只对【后续步骤】生效，本步骤当前进程看不见。
+          #   下面紧跟的复检就跑在本步骤里，必须同时 export，否则 askpass
+          #   读到空的 GH_TOKEN_FILE → "unable to read askpass response"。
+          export GH_TOKEN_FILE="$TOKEN_FILE"
+          export GIT_ASKPASS="${GIT_ASKPASS:-$RUNNER_TEMP/git-askpass}"
           echo "GH_TOKEN_FILE=$TOKEN_FILE" >> "$GITHUB_ENV"
+
+          # 自检：直接问一次 askpass，拿不到令牌就别往下跑（省得git 报黑盒错误）
+          if ! ASK=$(GIT_ASKPASS="$GIT_ASKPASS" "$GIT_ASKPASS" "Password for 'https://github.com':" 2>/dev/null) \
+               || [ -z "$ASK" ]; then
+            echo "::error::askpass 自检失败：拿不到令牌（令牌文件为空？askpass 脚本没可执行位？）"
+            exit 1
+          fi
+          echo "  askpass 自检通过（令牌长度 ${#ASK}，值不打印）"
 
           # 3) 带凭证复检：失败时打印脱敏后的真实错误，别只给一句黑盒提示
           if ERR=$(git ls-remote --exit-code --heads "$BASE_URL" \
