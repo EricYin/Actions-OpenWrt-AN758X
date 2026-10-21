@@ -325,6 +325,22 @@ jobs:
           echo "need_token=$NEED" >> "$GITHUB_OUTPUT"
           echo "backend=$R1" >> "$GITHUB_OUTPUT"
           echo "luci=$R2" >> "$GITHUB_OUTPUT"
+
+          # 只把「私有」的仓库放进令牌白名单。
+          # ⚠ 踩过的坑：repositories 里写了一个 App 没安装的仓库（哪怕是公开仓库），
+          #   令牌申请直接 422 —— "at least one repository that does not exist or
+          #   is not accessible to the parent installation"。公开仓库本来就不需要
+          #   令牌，列进去纯属给自己找麻烦。
+          TOKEN_REPOS=""
+          add_repo() {  # add_repo <public|private> <owner/repo>
+            [ "$1" = "private" ] || return 0
+            local name="${2#*/}"   # 去掉 owner/ 前缀，只留仓库名
+            if [ -z "$TOKEN_REPOS" ]; then TOKEN_REPOS="$name"; else TOKEN_REPOS="$TOKEN_REPOS,$name"; fi
+          }
+          add_repo "$R1" "${PRIVATE_REPO}"
+          add_repo "$R2" "${FTTR_LUCI_REPO}"
+          echo "token_repos=$TOKEN_REPOS" >> "$GITHUB_OUTPUT"
+          echo "  令牌白名单（仅私有仓库）：${TOKEN_REPOS:-（空）}"
           echo "结论：$( [ "$NEED" = true ] && echo '至少一个需要凭证 → 申请 App 令牌' || echo '全部公开 → 跳过取凭证' )"
           echo "--- 凭证配置情况（只看有没有配，不打印值）---"
           echo "  App 凭证 (PRIVATE_SOURCE_APP_ID + _PRIVATE_KEY): ${HAS_APP_CREDS}"
@@ -342,6 +358,12 @@ jobs:
         # "Input required and not supplied: app-id" 炸掉整个 job。
         # 加上之后：没配 App 就跳过，由后面的 Setup 步骤回退到 PAT。
         if: ${{ steps.probe.outputs.need_token == 'true' && env.HAS_APP_CREDS == 'true' }}
+        # ⚠ 关键：拿不到令牌不能炸掉整个 job。
+        #   典型场景——仓库私有但 App 没装到它（或 repositories 里混进了
+        #   公开但未安装的仓库）→ action 报 422，重试 4 次后失败。
+        #   设了 continue-on-error 之后，Setup 步骤会看到空的 APP_TOKEN
+        #   并自动回退到 PAT，构建不至于卡死在编译前。
+        continue-on-error: true
         uses: actions/create-github-app-token@v1
         with:
           # v1 用 app-id（App 的「App ID」）；升到 v3 要改名为 client-id 并且
@@ -350,10 +372,8 @@ jobs:
           private-key: ${{ secrets.PRIVATE_SOURCE_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           permission-contents: read
-          # 令牌只对这两个仓库有效，白名单外的仓库一律 404
-          repositories: |
-            openwrt-fttr
-            luci-app-fttr
+          # 只列探测判定为私有的仓库（逗号分隔），公开仓库不进白名单
+          repositories: ${{ steps.probe.outputs.token_repos }}
 
       - name: Prepare private Git authentication
         if: ${{ steps.probe.outputs.need_token == 'true' && (env.HAS_APP_CREDS == 'true' || env.HAS_PAT == 'true') }}
@@ -394,6 +414,10 @@ jobs:
           # 1) 选凭证：App 安装令牌 > PAT Secret
           if [ -n "${APP_TOKEN}" ]; then
             TOKEN="${APP_TOKEN}"; SRC="GitHub App 安装令牌"
+          elif [ "${HAS_APP_CREDS}" = "true" ] && [ "${{ steps.probe.outputs.need_token }}" = "true" ]; then
+            echo "::warning::App 凭证已配置，但令牌申请失败（见上一步日志）。"
+            echo "  最常见原因：App 的 Install App → Only select repositories 里没勾上探测判定为私有的仓库，"
+            echo "  或 repositories 白名单混进了未安装的仓库（HTTP 422）。回退到 PAT。"
           elif [ -n "${SEC_TOKEN}" ]; then
             TOKEN="${SEC_TOKEN}"; SRC="Secret PRIVATE_REPO_TOKEN"
           elif [ -n "${SEC_TOKEN_LEGACY}" ]; then

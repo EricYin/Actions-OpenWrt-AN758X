@@ -75,21 +75,33 @@ jobs:
           echo "need_token=$NEED" >> "$GITHUB_OUTPUT"
           echo "backend=$R1" >> "$GITHUB_OUTPUT"
           echo "luci=$R2" >> "$GITHUB_OUTPUT"
+
+          # 只把私有仓库放进令牌白名单：混进公开但未安装的仓库会 422
+          TOKEN_REPOS=""
+          add_repo() {
+            [ "$1" = "private" ] || return 0
+            local name="${2#*/}"
+            if [ -z "$TOKEN_REPOS" ]; then TOKEN_REPOS="$name"; else TOKEN_REPOS="$TOKEN_REPOS,$name"; fi
+          }
+          add_repo "$R1" "${PRIVATE_REPO}"
+          add_repo "$R2" "${FTTR_LUCI_REPO}"
+          echo "token_repos=$TOKEN_REPOS" >> "$GITHUB_OUTPUT"
+          echo "  令牌白名单（仅私有仓库）：${TOKEN_REPOS:-（空）}"
           echo "结论：$( [ "$NEED" = true ] && echo '至少一个需要凭证 → 申请 App 令牌' || echo '全部公开 → 跳过取凭证' )"
 
       - name: Create private source token
         id: private-source-token
         # 没配 App 凭证就跳过（否则 action 抛 Input required and not supplied: app-id）
         if: ${{ steps.probe.outputs.need_token == 'true' && env.HAS_APP_CREDS == 'true' }}
+        # 拿不到令牌不炸 job：交给 Setup 步骤回退 PAT
+        continue-on-error: true
         uses: actions/create-github-app-token@v1
         with:
           app-id: ${{ secrets.PRIVATE_SOURCE_APP_ID }}
           private-key: ${{ secrets.PRIVATE_SOURCE_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           permission-contents: read
-          repositories: |
-            openwrt-fttr
-            luci-app-fttr
+          repositories: ${{ steps.probe.outputs.token_repos }}
 
       - name: Prepare private Git authentication
         if: ${{ steps.probe.outputs.need_token == 'true' && (env.HAS_APP_CREDS == 'true' || env.HAS_PAT == 'true') }}
