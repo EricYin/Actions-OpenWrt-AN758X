@@ -20,6 +20,8 @@ on:
 env:
   PRIVATE_REPO: ${{ github.event.inputs.private_repo || 'qwe-qaq/openwrt-fttr' }}
   PRIVATE_REPO_BRANCH: ${{ github.event.inputs.private_repo_branch || 'main' }}
+  FTTR_LUCI_REPO: ${{ github.event.inputs.fttr_luci_repo || 'qwe-qaq/luci-app-fttr' }}
+  FTTR_LUCI_BRANCH: ${{ github.event.inputs.fttr_luci_branch || 'main' }}
 
 # 最小权限：只需要 checkout 本仓库
 permissions:
@@ -29,6 +31,10 @@ jobs:
   test-pull:
     name: 私有仓库拉取测试
     runs-on: ubuntu-24.04
+    # 同上：secrets 不能进 step 级 if，先在 job 级 env 里算成布尔标志
+    env:
+      HAS_APP_CREDS: ${{ secrets.PRIVATE_SOURCE_APP_ID != '' && secrets.PRIVATE_SOURCE_APP_PRIVATE_KEY != '' }}
+      HAS_PAT: ${{ secrets.PRIVATE_REPO_TOKEN != '' || secrets.FTTR_TOKEN != '' }}
     steps:
       # 复现真实环境：checkout 会写入 http.https://github.com/.extraheader，
       # 必须验证凭证步骤能正确清掉它，否则它会盖掉 insteadOf 注入的 PAT
@@ -45,9 +51,36 @@ jobs:
       # 1 小时有效、仅限白名单仓库、contents 只读、job 结束自动吊销；
       # 配不出来才回退到 Secret 里的 PAT。
       # =========================================================
+      # 先探测后取凭证：两个仓库全公开就一个令牌都不申请
+      - name: Probe FTTR repos visibility
+        id: probe
+        if: ${{ env.PRIVATE_REPO != 'none' }}
+        run: |
+          probe() {  # stdout: public|private；人读提示走 stderr
+            local repo="$1" br="$2"
+            if git ls-remote --exit-code --heads "https://github.com/${repo}" \
+                 "refs/heads/${br}" >/dev/null 2>&1; then
+              echo "  ✅ ${repo} (分支 ${br}) —— 公开，匿名可读" >&2
+              echo "public"
+            else
+              echo "  🔒 ${repo} (分支 ${br}) —— 匿名不可读，需要凭证" >&2
+              echo "private"
+            fi
+          }
+          echo "=== FTTR 仓库可见性探测（匿名）==="
+          R1=$(probe "${PRIVATE_REPO}" "${PRIVATE_REPO_BRANCH}")
+          R2=$(probe "${FTTR_LUCI_REPO}" "${FTTR_LUCI_BRANCH}")
+          NEED=false
+          [ "$R1" = "private" ] || [ "$R2" = "private" ] && NEED=true
+          echo "need_token=$NEED" >> "$GITHUB_OUTPUT"
+          echo "backend=$R1" >> "$GITHUB_OUTPUT"
+          echo "luci=$R2" >> "$GITHUB_OUTPUT"
+          echo "结论：$( [ "$NEED" = true ] && echo '至少一个需要凭证 → 申请 App 令牌' || echo '全部公开 → 跳过取凭证' )"
+
       - name: Create private source token
         id: private-source-token
-        if: ${{ env.PRIVATE_REPO != 'none' }}
+        # 没配 App 凭证就跳过（否则 action 抛 Input required and not supplied: app-id）
+        if: ${{ steps.probe.outputs.need_token == 'true' && env.HAS_APP_CREDS == 'true' }}
         uses: actions/create-github-app-token@v1
         with:
           app-id: ${{ secrets.PRIVATE_SOURCE_APP_ID }}
@@ -59,7 +92,7 @@ jobs:
             luci-app-fttr
 
       - name: Prepare private Git authentication
-        if: ${{ env.PRIVATE_REPO != 'none' }}
+        if: ${{ steps.probe.outputs.need_token == 'true' && (env.HAS_APP_CREDS == 'true' || env.HAS_PAT == 'true') }}
         run: |
           install -m 700 "$GITHUB_WORKSPACE/scripts/git_askpass.sh" "$RUNNER_TEMP/git-askpass"
           echo "GIT_ASKPASS=$RUNNER_TEMP/git-askpass" >> "$GITHUB_ENV"
@@ -76,6 +109,7 @@ jobs:
           SEC_TOKEN_LEGACY: ${{ secrets.FTTR_TOKEN }}
         run: |
           TOKEN="${APP_TOKEN:-${SEC_TOKEN:-${SEC_TOKEN_LEGACY}}}"
+          echo "  App 凭证已配置: ${HAS_APP_CREDS}    PAT 已配置: ${HAS_PAT}"
 
           echo "=== 1. extraheader 残留检查（只报存在性，不打印内容）==="
           for scope in global local; do
@@ -120,6 +154,12 @@ jobs:
         run: |
           if [ "${PRIVATE_REPO}" = "none" ]; then
             echo "⚠ PRIVATE_REPO=none —— 跳过拉取测试"
+            exit 0
+          fi
+
+          # 探测已认定两个仓库都能匿名读 → 一个凭证都不注入
+          if [ "${{ steps.probe.outputs.need_token }}" != "true" ]; then
+            echo "✅ 探测结论：${PRIVATE_REPO} / ${FTTR_LUCI_REPO} 均可匿名访问（公开仓库），不注入任何凭证"
             exit 0
           fi
 
