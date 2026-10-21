@@ -1,4 +1,0 @@
-# 本仓库所有脚本/config 都在 Linux（GitHub runner）或 OpenWrt 设备上执行：
-# CRLF 会让 shebang 报 bad interpreter、bash 报 $'\r'、OpenWrt 的 .config
-# 把 "y\r" 当值导致整包被静默剔除。统一 LF，覆盖本机 core.autocrlf。
-* text=auto eol=lf
