@@ -249,4 +249,6 @@ if [ -f "$OSREL_TPL" ]; then
   echo "✅ os-release 同步 -> $OSREL_LINE"
 fi
 
+[ -f scripts/diy-part2-crypto.sh ] && . ./scripts/diy-part2-crypto.sh
+
 echo "🎉 diy-part2.sh 执行完毕 (author=$FW_AUTHOR)"
