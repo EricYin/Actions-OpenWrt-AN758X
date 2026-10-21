@@ -10,8 +10,16 @@ echo "::group::加密加速可选包 (ARM64CE=$OPT_CRYPTO_ARM64CE CHACHA=$OPT_CR
 
 # ------------------------------------------------------------ 探测 SoC / 机型
 # AN7581 无 ARMv8 AES 指令，只能走 NEON 位切片；AN7583 有 aes/pmull/sha1/sha2，
-# 可以走 Crypto Extensions。这里自动判断，也可以手动覆盖：SOC_OVERRIDE=an7583
+# 可以走 Crypto Extensions。
+#
+# ⚠ 优先级：外部传入的 SOC > SOC_OVERRIDE > 自动探测。
+#   你的 workflow 在 "Resolve device profile" 步骤里已经按机型校正过 SOC 并
+#   写进 GITHUB_ENV，diy-part2.sh 执行时 $SOC 就是准的。本文件是被 source 的，
+#   直接赋值 SOC= 会改写父脚本的同名变量——所以必须先认外部值，不要盲猜。
 detect_soc() {
+  case "${SOC:-}" in
+    an7581|an7583) echo "$SOC"; return ;;
+  esac
   if [ -n "${SOC_OVERRIDE:-}" ]; then
     echo "$SOC_OVERRIDE"
     return
@@ -41,6 +49,15 @@ detect_soc() {
 
 SOC="$(detect_soc)"
 echo "检测到 SoC: $SOC"
+
+# 顶层 .config 必须已存在（由 Load custom configuration 步骤生成），
+# 否则 cat >> 会凭空建出一个只有几行包的残缺 .config，后续 defconfig 把
+# 整个机型配置冲掉。
+if [ ! -f .config ]; then
+  echo "::warning::当前目录没有 .config，跳过可选包追加（cwd=$PWD）"
+  echo "::endgroup::"
+  return 0 2>/dev/null || exit 0
+fi
 
 # --------------------------------------------------- 定位 target 内核 config
 kernel_cfg_path() {
