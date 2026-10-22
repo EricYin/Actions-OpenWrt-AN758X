@@ -38,10 +38,15 @@ env:
   #
   # ⚠ 默认值不能用 "|| " 兜：GitHub 表达式里字符串 '0' 会被转成数字 0 判为假，
   #   `${{ github.event.inputs.x || '1' }}` 在用户显式选 0 时会错误地返回 '1'。
-  #   因此 arm64ce / chacha 用 "!= '0'"（缺省即开），eip93 用 "== '1'"（缺省即关）。
+  #
+  # ⚠ 也不能用 "!= '0'" 兜：本文件有 repository_dispatch 触发器，那种触发下
+  #   github.event.inputs.* 为 null，null 在字符串比较里被当成空串 ''，
+  #   '' != '0' 成立 → 返回 '1'。也就是说声明的 default: '0' 完全失效，
+  #   repository_dispatch / API 重跑时开关会被静默打开。
+  #   三个开关统一用 "== '1'"：只有显式传 '1' 才开，其余（0 / 空 / null）全关。
   # =========================================================
-  OPT_CRYPTO_ARM64CE: ${{ github.event.inputs.opt_arm64ce != '0' && '1' || '0' }}
-  OPT_CRYPTO_CHACHA:  ${{ github.event.inputs.opt_chacha  != '0' && '1' || '0' }}
+  OPT_CRYPTO_ARM64CE: ${{ github.event.inputs.opt_arm64ce == '1' && '1' || '0' }}
+  OPT_CRYPTO_CHACHA:  ${{ github.event.inputs.opt_chacha  == '1' && '1' || '0' }}
   OPT_CRYPTO_EIP93:   ${{ github.event.inputs.opt_eip93   == '1' && '1' || '0' }}
 
   # ---- FTTR 相关仓库 ----
@@ -107,17 +112,17 @@ on:
         default: '0'
         type: choice
         options:
-          - '1'
           - '0'
+          - '1'
 
       opt_chacha:
-        description: 'ChaCha20-Poly1305 NEON（Xray / sing-box / WireGuard 推荐）'
+        description: 'ChaCha20-Poly1305 NEON（Xray / sing-box / WireGuard 推荐）。注：机型 configs 里 chacha20 三个包本就默认 =y，此开关主要额外带 gcm/ccm/ctr/xts'
         required: false
         default: '0'
         type: choice
         options:
-          - '1'
           - '0'
+          - '1'
 
       opt_eip93:
         description: 'EIP93 硬件加密引擎（仅大块 IPSec / 大文件 TLS 有收益，小包更慢）'
