@@ -104,7 +104,7 @@ on:
       opt_arm64ce:
         description: 'arm64 汇编加密实现（AN7581 走 NEON 位切片 / AN7583 走 CE，按 SoC 自动选）'
         required: false
-        default: '1'
+        default: '0'
         type: choice
         options:
           - '1'
@@ -113,7 +113,7 @@ on:
       opt_chacha:
         description: 'ChaCha20-Poly1305 NEON（Xray / sing-box / WireGuard 推荐）'
         required: false
-        default: '1'
+        default: '0'
         type: choice
         options:
           - '1'
