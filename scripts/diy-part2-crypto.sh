@@ -1,6 +1,30 @@
 #!/bin/sh
 # ==============================================================================
 #  AN758X (Airoha AN7581 / AN7583) 加密加速 —— 可选增强补丁
+#
+#  被 diy-part2.sh 用 ". ./scripts/diy-part2-crypto.sh" source 进去。
+#
+#  ⚠ diy-part2.sh 开头是 `set -euo pipefail`，本文件在它的 shell 里执行：
+#    任何一条命令返回非 0 都会让父脚本当场退出，diy-part2.sh 剩下的时区、
+#    os-release 等步骤全部不执行，且该步骤以非 0 退出 → 整轮构建中断。
+#    所以：
+#      - 所有可能失败的命令要么放在 if/|| 上下文里，要么用函数包住并 return 0
+#      - 文件末尾显式 return 0，保证正常路径也不会带着上一个命令的状态退出
+#      - diy-part2.sh 那一行建议写成 `... && . ./xxx.sh || true` 双保险
+# ==============================================================================
+
+# 追加顶层 .config 的包开关：先删同名旧行（含 "# X is not set"）再追加。
+# 仓库 configs/*.config 里本来就带了 chacha20 / lib-chacha20 等 3 个包，
+# 直接 cat >> 会留下重复行（defconfig 虽以最后一行为准，但 diffconfig 输出
+# 和人工排查都会被干扰）。
+append_pkg() {
+  for kv in "$@"; do
+    k="${kv%%=*}"
+    sed -i "/^${k}=/d; /^# ${k} is not set\$/d" .config
+    printf '%s\n' "$kv" >> .config
+  done
+}
+
 # ---------------------------------------------------------------- 开关默认值
 : "${OPT_CRYPTO_ARM64CE:=0}"
 : "${OPT_CRYPTO_CHACHA:=0}"
@@ -137,22 +161,21 @@ if [ "$OPT_CRYPTO_CHACHA" = "1" ]; then
   echo "追加可选包: ChaCha20-Poly1305"
   # aarch64 上 kmod-crypto-lib-chacha20 会自动带 CONFIG_CRYPTO_CHACHA20_NEON，
   # chacha20poly1305 同理，NEON 版无需手写内核符号。
-  cat >> .config <<'EOF'
-CONFIG_PACKAGE_kmod-crypto-lib-chacha20=y
-CONFIG_PACKAGE_kmod-crypto-lib-chacha20poly1305=y
-CONFIG_PACKAGE_kmod-crypto-chacha20poly1305=y
-CONFIG_PACKAGE_kmod-crypto-lib-poly1305=y
-CONFIG_PACKAGE_kmod-crypto-lib-curve25519=y
-CONFIG_PACKAGE_kmod-crypto-kpp=y
-CONFIG_PACKAGE_kmod-crypto-ecdh=y
-CONFIG_PACKAGE_kmod-crypto-gcm=y
-CONFIG_PACKAGE_kmod-crypto-ccm=y
-CONFIG_PACKAGE_kmod-crypto-ctr=y
-CONFIG_PACKAGE_kmod-crypto-cbc=y
-CONFIG_PACKAGE_kmod-crypto-xts=y
-CONFIG_PACKAGE_kmod-crypto-seqiv=y
-CONFIG_PACKAGE_kmod-crypto-echainiv=y
-EOF
+  append_pkg \
+  CONFIG_PACKAGE_kmod-crypto-lib-chacha20=y \
+  CONFIG_PACKAGE_kmod-crypto-lib-chacha20poly1305=y \
+  CONFIG_PACKAGE_kmod-crypto-chacha20poly1305=y \
+  CONFIG_PACKAGE_kmod-crypto-lib-poly1305=y \
+  CONFIG_PACKAGE_kmod-crypto-lib-curve25519=y \
+  CONFIG_PACKAGE_kmod-crypto-kpp=y \
+  CONFIG_PACKAGE_kmod-crypto-ecdh=y \
+  CONFIG_PACKAGE_kmod-crypto-gcm=y \
+  CONFIG_PACKAGE_kmod-crypto-ccm=y \
+  CONFIG_PACKAGE_kmod-crypto-ctr=y \
+  CONFIG_PACKAGE_kmod-crypto-cbc=y \
+  CONFIG_PACKAGE_kmod-crypto-xts=y \
+  CONFIG_PACKAGE_kmod-crypto-seqiv=y \
+  CONFIG_PACKAGE_kmod-crypto-echainiv=y
 fi
 
 # ============================== ③ 可选包：EIP93 硬件引擎 ==============================
@@ -161,22 +184,21 @@ if [ "$OPT_CRYPTO_EIP93" = "1" ]; then
   # 说明：AN7581 内置 EIP93 (crypto@1e004000, compatible airoha,en7581-eip93)。
   # 但它只在大包上划算：实测 AES 需 ≥512 字节才快过软件，MD5/SHA1/SHA2 全尺寸
   # 都是软件更快。代理类小包场景开着反而更慢，所以默认关。
-  cat >> .config <<'EOF'
-CONFIG_PACKAGE_kmod-crypto-hw-eip93=y
-CONFIG_PACKAGE_kmod-crypto-authenc=y
-CONFIG_PACKAGE_kmod-crypto-des=y
-CONFIG_PACKAGE_kmod-crypto-md5=y
-CONFIG_PACKAGE_kmod-crypto-sha1=y
-CONFIG_PACKAGE_kmod-crypto-sha256=y
-CONFIG_PACKAGE_kmod-crypto-sha512=y
-CONFIG_PACKAGE_kmod-crypto-hmac=y
-CONFIG_PACKAGE_kmod-crypto-manager=y
-CONFIG_PACKAGE_kmod-crypto-hash=y
-CONFIG_PACKAGE_kmod-crypto-aead=y
-CONFIG_PACKAGE_kmod-crypto-null=y
-CONFIG_PACKAGE_kmod-crypto-rng=y
-CONFIG_PACKAGE_kmod-random-core=y
-EOF
+  append_pkg \
+  CONFIG_PACKAGE_kmod-crypto-hw-eip93=y \
+  CONFIG_PACKAGE_kmod-crypto-authenc=y \
+  CONFIG_PACKAGE_kmod-crypto-des=y \
+  CONFIG_PACKAGE_kmod-crypto-md5=y \
+  CONFIG_PACKAGE_kmod-crypto-sha1=y \
+  CONFIG_PACKAGE_kmod-crypto-sha256=y \
+  CONFIG_PACKAGE_kmod-crypto-sha512=y \
+  CONFIG_PACKAGE_kmod-crypto-hmac=y \
+  CONFIG_PACKAGE_kmod-crypto-manager=y \
+  CONFIG_PACKAGE_kmod-crypto-hash=y \
+  CONFIG_PACKAGE_kmod-crypto-aead=y \
+  CONFIG_PACKAGE_kmod-crypto-null=y \
+  CONFIG_PACKAGE_kmod-crypto-rng=y \
+  CONFIG_PACKAGE_kmod-random-core=y
 
   # 内核侧：确保 CONFIG_CRYPTO_HW 打开，否则 kmod 编不出来
   set_kcfg "$KCFG" "CONFIG_CRYPTO_HW=y"
@@ -184,11 +206,14 @@ fi
 
 # ============================== ④ 用户态 /dev/crypto 接口（随任一开关开） ==============================
 if [ "$OPT_CRYPTO_EIP93" = "1" ] || [ "$OPT_CRYPTO_CHACHA" = "1" ]; then
-  cat >> .config <<'EOF'
-CONFIG_PACKAGE_kmod-crypto-user=y
-CONFIG_PACKAGE_kmod-cryptodev=y
-CONFIG_PACKAGE_libopenssl-devcrypto=y
-EOF
+  append_pkg \
+  CONFIG_PACKAGE_kmod-crypto-user=y \
+  CONFIG_PACKAGE_kmod-cryptodev=y \
+  CONFIG_PACKAGE_libopenssl-devcrypto=y
 fi
 
 echo "::endgroup::"
+
+# 正常路径也要显式 return 0：父脚本 set -e 下，末尾若残留上一条命令的
+# 非 0 状态会让 diy-part2.sh 当场退出。 sourced 时 return，直接执行时 exit。
+return 0 2>/dev/null || exit 0
