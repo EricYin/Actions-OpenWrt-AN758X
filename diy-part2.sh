@@ -5,6 +5,8 @@
 #
 #   1) 默认时区改成中国（Asia/Shanghai, CST-8）
 #   2) 5G WiFi：国家码 CN、信道 auto、频宽 160MHz
+#   3) 概览页「CPU 使用率（%）」行：显示 USR/SYS + 每个核心的明细
+#   4) 固件版本后追加「作者 + 构建时间」
 #
 # ================================================================
 
@@ -23,12 +25,13 @@ WIFI_5G_CHANNEL="${WIFI_5G_CHANNEL:-auto}"     # 信道（auto = 自动选择）
 WIFI_5G_HTMODE="${WIFI_5G_HTMODE:-HE160}"      # 160MHz（WiFi6）；回落 HE80
 WIFI_5G_FALLBACK="${WIFI_5G_FALLBACK:-HE80}"   # 硬件不支持 160MHz 时的回落值
 
-readonly FW_AUTHOR="qwe"
+# 可由 workflow 的 fw_author 输入项覆盖（经 env 注入）；本地单独跑时默认 qwe
+FW_AUTHOR="${FW_AUTHOR:-qwe}"
 FW_BUILD_TIME="${FW_BUILD_TIME:-}"
-FW_DESC_SUFFIX="${FW_DESC_SUFFIX:-}" 
+FW_DESC_SUFFIX="${FW_DESC_SUFFIX:-}"
 
 echo "配置：5G country=$WIFI_5G_COUNTRY channel=$WIFI_5G_CHANNEL htmode=$WIFI_5G_HTMODE fallback=$WIFI_5G_FALLBACK"
-echo "配置：FW_AUTHOR=$FW_AUTHOR (固定)"
+echo "配置：FW_AUTHOR=$FW_AUTHOR"
 
 # ---------------------------------------------------------
 # 1. 修改 config_generate 的默认值（首次开机生成的 /etc/config/system）
@@ -67,6 +70,14 @@ if [ -f .config ]; then
   sed -i '/^CONFIG_PACKAGE_zoneinfo-asia=/d; /^# CONFIG_PACKAGE_zoneinfo-asia is not set/d' .config
   echo "CONFIG_PACKAGE_zoneinfo-asia=y    # 亚洲时区数据库（中国时区需要）" >> .config
   echo "✅ zoneinfo-asia 已加入 .config"
+
+  # libffi：见 diy-part1.sh 的同名段落。源码树原本没有这个包，
+  # python3(3.14) 的 _ctypes 却必须要它的 ffi.h / libffi.pc，
+  # 缺了就 fatal error 拖垮 world。这里显式打开 target 版，
+  # 让 Build/InstallDev 把头文件装进 staging_dir。
+  sed -i '/^CONFIG_PACKAGE_libffi=/d; /^# CONFIG_PACKAGE_libffi is not set/d' .config
+  echo "CONFIG_PACKAGE_libffi=y           # python3 _ctypes 需要 ffi.h / libffi.pc" >> .config
+  echo "✅ libffi 已加入 .config"
 fi
 
 # ---------------------------------------------------------
@@ -186,6 +197,25 @@ if [ -f .config ]; then
   fi
 fi
 
+# ---------------------------------------------------------
+# 5. 概览页「CPU 使用率（%）」行：显示 USR/SYS + 每核明细
+#
+#    ImmortalWrt 的 luci 把这一行的值写成
+#      luci.getCPUUsage → popen("top -n1 | awk '/^CPU/ {printf(\"%d%\", 100 - $8)}'")
+#    只有一个总占用率。这里把它改指到 files/sbin/cpuusage（rootfs 覆盖，
+#    已由 workflow 第 6 步拷进源码树的 files/），前端 10_system.js 与 ACL
+#    都不用动。
+#
+#    脚本负责判断、打补丁与自检，找不到目标只 warning 不中断编译 ——
+#    这是纯显示层的东西，不该让它把一次几小时的构建搞挂。
+# ---------------------------------------------------------
+PATCH_CPUUSAGE="$(dirname "$0")/scripts/patch-luci-cpuusage.sh"
+if [ -f "$PATCH_CPUUSAGE" ]; then
+  PONWRT_DIR=. bash "$PATCH_CPUUSAGE" || true
+else
+  echo "::warning::未找到 $PATCH_CPUUSAGE，跳过概览页 CPU 使用率行定制"
+fi
+
 [ -z "$FW_BUILD_TIME" ] && FW_BUILD_TIME="$(TZ="${TZ:-Asia/Shanghai}" date '+%Y-%m-%d %H:%M')"
 
 VER_CODE="$(sed -n 's/^CONFIG_VERSION_CODE="\(.*\)"$/\1/p' .config 2>/dev/null || true)"
@@ -218,5 +248,11 @@ if [ -f "$OSREL_TPL" ]; then
   perl -i -pe 's/^OPENWRT_RELEASE=.*/$ENV{OSREL_LINE}/' "$OSREL_TPL"
   echo "✅ os-release 同步 -> $OSREL_LINE"
 fi
+
+# 用 -f 不要用 -x：git checkout / Windows 打包会丢可执行位，-x 判失败会静默整段跳过。
+# 末尾 || true：本文件开头是 set -euo pipefail，被 source 的子脚本里任何一步
+# 返回非 0 都会让这里当场退出，后面的步骤全不执行且整轮构建中断。
+# 加密是可选增强，不该有能力搞挂构建。
+[ -f scripts/diy-part2-crypto.sh ] && . ./scripts/diy-part2-crypto.sh || true
 
 echo "🎉 diy-part2.sh 执行完毕 (author=$FW_AUTHOR)"
