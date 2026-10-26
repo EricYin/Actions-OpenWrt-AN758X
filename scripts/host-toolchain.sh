@@ -171,20 +171,65 @@ key)
 # ---------------------------------------------------------------
 build)
   FAIL=0
+
+  # 产物是否真的落地了。
+  # ★ make 返回 0 不等于真编出了东西 —— 包已 installed（stamp 在）/
+  #   没有 HostBuild 定义 / target 名不对时，make 都会安静地返回 0。
+  #   所以退出码之外必须再看一眼产物。
+  host_artifacts_present() {
+    [ -e staging_dir/host/bin/go ]    && return 0
+    [ -e staging_dir/host/bin/rustc ] && return 0
+    [ -e staging_dir/host/bin/cargo ] && return 0
+    find staging_dir/host/stamp -maxdepth 1 -type f \
+      \( -name '.golang*' -o -name '.rust*' -o -name '.go-bootstrap*' \) 2>/dev/null \
+      | grep -q . && return 0
+    return 1
+  }
+
+  dump_diag() { # $1=场合说明
+    echo "::warning::$1：make 返回 0，但 staging_dir/host 里没有 go / rustc / stamp"
+    echo "  --- 诊断 ---"
+    echo "  1) host bin 里的相关文件:"
+    ls -1 staging_dir/host/bin 2>/dev/null | grep -iE '^(go|gofmt|rustc|cargo|rustdoc)$' \
+      | sed 's/^/     /' || echo "     (bin 目录为空或不存在)"
+    echo "  2) host stamp 里的相关文件:"
+    ls -1 staging_dir/host/stamp 2>/dev/null | grep -iE 'golang|rust|go-bootstrap' | head -10 \
+      | sed 's/^/     /' || echo "     (无)"
+    echo "  3) host stamp 总数: $(ls -1 staging_dir/host/stamp 2>/dev/null | wc -l)"
+    echo "  4) build_dir/host 下的目录:"
+    ls -d build_dir/host/* 2>/dev/null | head -5 | sed 's/^/     /' || echo "     (无)"
+    echo "  5) dl 里的 go/rust 源码包:"
+    ls -1 dl 2>/dev/null | grep -iE '^(go|rust)' | head -5 | sed 's/^/     /' || echo "     (无)"
+  }
+
   compile_host() { # $1=显示名 $2=package/相对路径
     local name="$1" rel="$2"
     if [ -z "$rel" ]; then
       echo "::warning::$name 不在 package/feeds 下，跳过 host 编译"
       return 0
     fi
+
+    # 源码先到位：步骤 33 的 make download 在本步之后，
+    # 不补这一次的话，网络/dl 缓存出问题时编译会静默缩水。
+    # ⚠ 用 package/X/download 而不是 package/X/host/download ——
+    #   buildroot 只给包定义了 download，没有 host/download 这一级。
+    echo "----- make package/$rel/download -----"
+    make "package/$rel/download" V=s || echo "::warning::$name download 有告警，继续尝试编译"
+
     echo "===== make package/$rel/host/compile ($JOBS 线程) ====="
-    if make "package/$rel/host/compile" -j"$JOBS"; then
+    if ! make "package/$rel/host/compile" -j"$JOBS" V=s; then
+      echo "::warning::$name 多线程编译失败，单线程重试"
+      if ! make "package/$rel/host/compile" -j1 V=s; then
+        echo "::warning::$name host 编译失败；不写缓存，后续 make 会再试一次"
+        FAIL=1
+        return 0
+      fi
+    fi
+    if host_artifacts_present; then
       echo "✅ $name host 编译完成"
-    elif make "package/$rel/host/compile" -j1 V=s; then
-      echo "✅ $name host 编译完成（单线程重试）"
     else
-      echo "::warning::$name host 编译失败；不写缓存，后续 make 会再试一次"
-      FAIL=1
+      # 这里只提示，完整诊断放最后统一打一次，避免几个包刷屏
+      echo "::warning::$name: make 返回 0 但 staging_dir/host 里还看不到产物"
     fi
   }
 
@@ -193,6 +238,13 @@ build)
   [ -n "$GO_BOOT_REL" ] && compile_host "golang-bootstrap" "$GO_BOOT_REL"
   [ "$HAS_GO" = "true" ] && compile_host "golang" "$GO_REL"
   [ "$HAS_RUST" = "true" ] && compile_host "rust" "$RUST_REL"
+
+  # 收尾再判一次：没有任何产物就当失败，避免 pack 出空包、污染缓存
+  if [ "$FAIL" = "0" ] && ! host_artifacts_present; then
+    echo "::warning::三个包都跑完了，staging_dir/host 里仍然什么都没有"
+    dump_diag "host 编译"
+    FAIL=1
+  fi
 
   if [ "$FAIL" != "0" ]; then
     echo "host_build_failed=true" >> "${GITHUB_OUTPUT:-/dev/null}"
