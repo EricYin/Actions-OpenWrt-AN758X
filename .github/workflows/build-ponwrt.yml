@@ -1073,6 +1073,32 @@ jobs:
             bash "$GITHUB_WORKSPACE/scripts/host-toolchain.sh" unpack "$BUILD_ROOT/openwrt"
 
       # =========================================================
+      # 12.35 确认 host gcc 在位
+      #
+      #   host 侧的 golang / rust 只用 host gcc（staging_dir/host/bin/gcc），
+      #   不需要 target 交叉编译器。它的来源两条路：
+      #     - 工具链缓存命中 → 整个 staging_dir/host* 从缓存解压出来，gcc 跟着回来；
+      #     - 未命中 → 步骤 20 的 make tools/install 现场编出来。
+      #   所以正常情况下必然在位；这一步的意义是「万一不在，早点说清楚」。
+      #
+      #   ⚠ 用软失败（只 warning）：
+      #     主流程的目标是出固件，不该为缓存环节多一个失败点。
+      #     gcc 真丢了的话，后面 make 自己会再编一遍，错误在那儿照样暴露。
+      #     独立流程 host-toolchain.yml 里同名那步是硬失败（exit 1），
+      #     因为那边没有固件目标，没 gcc 等于白跑一场。
+      # =========================================================
+      - name: Verify host gcc
+        continue-on-error: true
+        run: |
+          cd "$BUILD_ROOT/openwrt"
+          if [ ! -x staging_dir/host/bin/gcc ]; then
+            echo "::warning::staging_dir/host/bin/gcc 不存在 —— host 工具链无法编译"
+            echo "  （工具链缓存可能不完整；后续 make 会再编一遍，错误照常暴露）"
+            exit 0
+          fi
+          staging_dir/host/bin/gcc --version | head -1
+
+      # =========================================================
       # 12.4 真编译 host 侧 go(-bootstrap) / rust
       #
       #   只跑 <pkg>/host/compile，不碰任何 target 侧的东西。
