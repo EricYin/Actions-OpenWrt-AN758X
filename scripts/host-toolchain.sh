@@ -154,6 +154,63 @@ host_stage_dirs() {
   done
 }
 
+# ---------------------------------------------------------------
+# 按需判断：本次机型到底要不要 golang / rust
+#
+#   之前是「包在 package/feeds 里就编」，结果：
+#     - HM2004-DU 的机型配置里没有任何 Go 包，却照样跑了一遍
+#       golang bootstrap（go1.4→1.17→1.20→1.22→1.24 五段自举，40~70 分钟）；
+#     - HAS_PAT=false 时私有仓库拉不下来，h3c-fttr-tools（唯一的 Rust 包）
+#       根本不在树里，rustc 也照样编了一遍。
+#
+#   判据：包 Makefile 里 include 了 golang-package.mk / rust-package.mk，
+#   且 .config 里 CONFIG_PACKAGE_<包名>=y。两个条件都满足才算需要。
+# ---------------------------------------------------------------
+pkg_selected() { # $1=包名
+  grep -qE "^CONFIG_PACKAGE_${1}=y$" .config 2>/dev/null
+}
+
+need_stack() { # $1=golang-package.mk|rust-package.mk
+  local mk name
+  for mk in $(grep -Rl --include=Makefile -- "$1" package/ 2>/dev/null); do
+    name=$(basename "$(dirname "$mk")")
+    if pkg_selected "$name"; then
+      echo "    需要 $1 ← $name"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------
+# 单个包的产物是否已在位。
+#
+#   ★ 这条是「缓存缺口」的关键。host 缓存可能只有一半：
+#     上次 golang 编成了、rust 因缺交叉编译器 panic，pack 时
+#     「部分成功也算成功」就把 golang 单独存了。下次 unpack 成功
+#     → build 被整体跳过 → rust 永远没人编 → 永远进不了缓存，
+#     每次都在 Compile the firmware 里现编一遍（30~60 分钟）。
+#
+#   所以逐个包判断：已在位就跳过，缺哪个补哪个。
+# ---------------------------------------------------------------
+pkg_has_artifacts() { # $1=golang|golang-bootstrap|rust
+  local d
+  case "$1" in
+    golang|golang-bootstrap)
+      for d in $(host_stage_dirs); do [ -e "$d/bin/go" ] && return 0; done
+      return 1
+      ;;
+    rust)
+      for d in $(host_stage_dirs); do
+        [ -e "$d/bin/rustc" ] && return 0
+        [ -e "$d/bin/cargo" ] && return 0
+      done
+      return 1
+      ;;
+  esac
+  return 1
+}
+
 case "$SUBCMD" in
 
 # ---------------------------------------------------------------
@@ -239,6 +296,12 @@ build)
       return 0
     fi
 
+    # 已在位就不重复编 —— 幂等，用于补齐缓存缺口
+    if pkg_has_artifacts "$name"; then
+      echo "⏭️  $name 产物已在位（缓存里有了），跳过编译"
+      return 0
+    fi
+
     # 源码先到位：步骤 33 的 make download 在本步之后，
     # 不补这一次的话，网络/dl 缓存出问题时编译会静默缩水。
     # ⚠ 用 package/X/download 而不是 package/X/host/download ——
@@ -264,6 +327,27 @@ build)
   }
 
   # ---------------------------------------------------------------
+  # ★ 只编「真的有人用」的语言栈（need_stack / pkg_selected 见文件顶部）
+  #
+  #   之前是「包在 package/feeds 里就编」，结果：
+  #     - HM2004-DU 的机型配置里没有任何 Go 包，却照样跑了一遍
+  #       golang bootstrap（go1.4→1.17→1.20→1.22→1.24 五段自举，40~70 分钟）；
+  #     - HAS_PAT=false 时私有仓库拉不下来，h3c-fttr-tools（唯一的 Rust 包）
+  #       根本不在树里，rustc 也照样编了一遍。
+  # ================================================================
+  echo "----- 判断本次真正需要哪些 host 语言栈 -----"
+  if need_stack golang-package.mk; then NEED_GO=true;   else NEED_GO=false;   echo "    无需 golang（没有选中的 Go 包）"; fi
+  if need_stack rust-package.mk;   then NEED_RUST=true; else NEED_RUST=false; echo "    无需 rust（没有选中的 Rust 包）"; fi
+
+  if [ "$NEED_GO" = "false" ] && [ "$NEED_RUST" = "false" ]; then
+    echo "::warning::本次机型没有任何 Go / Rust 包，host 工具链缓存无意义，跳过"
+    echo "host_build_failed=true" >> "${GITHUB_OUTPUT:-/dev/null}"
+    exit 0
+  fi
+  [ "$NEED_GO"   = "false" ] && HAS_GO=false
+  [ "$NEED_RUST" = "false" ] && HAS_RUST=false
+
+  # ---------------------------------------------------------------
   # rust 的前置条件：需要 target 交叉编译器。
   #
   #   实测 rust 的 host 编译会 configure 出
@@ -283,7 +367,11 @@ build)
     else
       echo "::warning::没有 target 交叉编译器（staging_dir/toolchain*/bin/*-gcc）"
       echo "::warning::rust 的 host 构建需要它 —— 请先跑 make toolchain/install"
-      echo "::warning::本次跳过 rust，仅编 golang（golang 不需要它）"
+      if [ "$NEED_GO" = "true" ]; then
+        echo "::warning::本次跳过 rust（golang 不需要交叉编译器，仍会编）"
+      else
+        echo "::warning::本次跳过 rust，且无需 golang —— 没有可编的 host 语言栈"
+      fi
       HAS_RUST=false
     fi
   fi
@@ -320,6 +408,40 @@ build)
   ;;
 
 # ---------------------------------------------------------------
+# check：判断「还需要编什么」，用于让 workflow 决定要不要先装工具链。
+#
+#   存在的理由：host 缓存可能只有一半（上次 golang 编成了、rust 失败）。
+#   unpack 成功 → 若 workflow 一刀切跳过工具链安装，那缺的那半永远补不上。
+#   所以由这里先算出缺口，workflow 据此决定：
+#     缺口为空 → 连工具链都不用装，几十秒收工
+#     有缺口   → 正常装工具链（rust 缺口还要交叉编译器）再编
+# ---------------------------------------------------------------
+check)
+  echo "----- 本次机型需要的 host 语言栈 -----"
+  if need_stack golang-package.mk; then NEED_GO=true;   else NEED_GO=false;   echo "    无需 golang"; fi
+  if need_stack rust-package.mk;   then NEED_RUST=true; else NEED_RUST=false; echo "    无需 rust";   fi
+
+  GO_MISSING=false; RUST_MISSING=false
+  if [ "$NEED_GO" = "true" ] && ! pkg_has_artifacts golang;   then GO_MISSING=true;   fi
+  if [ "$NEED_RUST" = "true" ] && ! pkg_has_artifacts rust;   then RUST_MISSING=true; fi
+
+  ANY=false
+  { [ "$GO_MISSING" = "true" ] || [ "$RUST_MISSING" = "true" ]; } && ANY=true
+
+  out "NEED_GO=$NEED_GO"
+  out "NEED_RUST=$NEED_RUST"
+  out "GO_MISSING=$GO_MISSING"
+  out "RUST_MISSING=$RUST_MISSING"
+  out "NEED_ANY_BUILD=$ANY"
+  out "NEED_CROSS_COMPILER=$RUST_MISSING"
+  echo "========================================"
+  echo "golang: 需要=$NEED_GO 缺失=$GO_MISSING"
+  echo "rust  : 需要=$NEED_RUST 缺失=$RUST_MISSING"
+  echo "=> 还需要编译: $ANY（需要交叉编译器: $RUST_MISSING）"
+  echo "========================================"
+  ;;
+
+# ---------------------------------------------------------------
 pack)
   KEY="${HOST_CACHE_KEY:-}"
   [ -n "$KEY" ] || { echo "::error::缺 HOST_CACHE_KEY" >&2; exit 1; }
@@ -342,13 +464,34 @@ pack)
     find "$d" -maxdepth 2 -type d -name 'go-1*' 2>/dev/null >> "$LIST"
   done
   # 注：rustlib 是目录，tar 会自动递归，不用再列一遍
-  # 4) 可选：构建树（默认关，rust 的构建树太大）
+
+  # ---------------------------------------------------------------
+  # 4) ★ 最关键的一项：build_dir 里的 stamp 文件（只收 stamp，不收构建树）
+  #
+  #    为什么必须有它：HostBuild 的门禁是
+  #      HOST_STAMP_PREPARED   = build_dir/.../.prepared*
+  #      HOST_STAMP_CONFIGURED = build_dir/.../.configured*
+  #      HOST_STAMP_BUILT      = build_dir/.../.built      ← host-compile 就看这个
+  #      HOST_STAMP_INSTALLED  = staging_dir/.../stamp/.xxx_installed
+  #    也就是说「有没有装好」看 staging，「要不要重编」看 build_dir/.built。
+  #    只打包 staging 的二进制 + stamp，build_dir 的 .built 却丢了，
+  #    下次 make 仍然判定要重编 → rustc 从零自举（30~60 分钟），
+  #    缓存等于只省了个下载。这就是「缓存命中了还是很慢」的根因。
+  #
+  #    stamp 是空文件，几十字节，代价可以忽略；
+  #    真正大的构建树仍然不收（见 HOST_INCLUDE_BUILDDIR）。
+  # ---------------------------------------------------------------
+  find build_dir -type f \
+       \( -name '.built' -o -name '.prepared*' -o -name '.configured*' \) \
+       2>/dev/null >> "$LIST"
+
+  # 5) 可选：整个构建树（默认关，rust 的构建树 5~10GB，塞不进缓存配额）
   if [ "$HOST_INCLUDE_BUILDDIR" = "true" ]; then
     find build_dir/host build_dir/hostpkg -maxdepth 1 \
          \( -name 'golang*' -o -name 'go-*' -o -name 'go-bootstrap*' -o -name 'rust*' \) 2>/dev/null >> "$LIST"
   fi
 
-  # 去重（两套目录可能同时命中同一文件）
+  # 去重（多套目录可能同时命中同一文件）
   sort -u "$LIST" -o "$LIST"
 
   if [ ! -s "$LIST" ]; then
@@ -399,6 +542,13 @@ unpack)
          \( -name '.golang*' -o -name '.rust*' -o -name '.go-bootstrap*' \) \
          -exec touch {} + 2>/dev/null || true
   done < <(host_stage_dirs)
+
+  # build_dir 里的 .built / .prepared* / .configured* 同样要 touch。
+  # tar 还原的是旧 mtime，而源码树是刚 clone 的（mtime 是现在），
+  # 不 touch 的话 make 会认为「源码比构建产物新」从而重编。
+  find build_dir -type f \
+       \( -name '.built' -o -name '.prepared*' -o -name '.configured*' \) \
+       -exec touch {} + 2>/dev/null || true
 
   # 解出来却没有任何 host 二进制 = 这份缓存是空的，别让 make 以为装好了
   FOUND=0
