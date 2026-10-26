@@ -132,17 +132,24 @@ out() { # 同时写 GITHUB_OUTPUT（CI 里）和 stdout
 }
 
 # ---------------------------------------------------------------
-# host 产物的安放位置有两套：
-#   staging_dir/host      —— 普通 host 包（tools/ 那类）
-#   staging_dir/hostpkg   —— 用 HostBuild 编译的 package/ 包
+# host 产物的安放位置有三处，不是一个：
+#   staging_dir/host              —— 普通 host 包（tools/ 那类：gcc、cmake…）
+#   staging_dir/hostpkg           —— HostBuild 且不依赖 target 的包
+#                                    实测：golang / golang-bootstrap 在这里
+#                                    （构建树 build_dir/hostpkg/go-<ver>）
+#   staging_dir/target-*/host     —— HostBuild 但绑定 target 的包
+#                                    实测：rust 在这里（configure 的 --prefix
+#                                    就是 staging_dir/target-aarch64.../host，
+#                                    因为它要 --target=aarch64-unknown-linux-musl
+#                                    并 link 到 musl-root）
 #
-#   实测 ponwrt 的 golang / golang-bootstrap 构建目录是
-#   build_dir/hostpkg/go-<ver>，装进去的位置多半也是 hostpkg。
-#   只盯着 staging_dir/host 的话，编了两小时最后还是「没有产物可打包」。
-#   所以这里把两边的 bin / lib / stamp 都纳入，哪个存在收哪个。
+#   只盯着 staging_dir/host 的话，会出现「编了两小时，最后
+#   『没有任何 host 产物可打包』」—— 时间全白花，下次还得重编。
+#   所以这里三处全扫，哪个存在收哪个。
 # ---------------------------------------------------------------
 host_stage_dirs() {
-  for d in staging_dir/host staging_dir/hostpkg; do
+  local d
+  for d in staging_dir/host staging_dir/hostpkg staging_dir/target-*/host; do
     [ -d "$d" ] && printf '%s\n' "$d"
   done
 }
@@ -256,17 +263,53 @@ build)
     fi
   }
 
+  # ---------------------------------------------------------------
+  # rust 的前置条件：需要 target 交叉编译器。
+  #
+  #   实测 rust 的 host 编译会 configure 出
+  #     --target=aarch64-unknown-linux-musl
+  #     --set=target.aarch64-unknown-linux-musl.cc=aarch64-openwrt-linux-musl-gcc
+  #     --set=...musl-root=staging_dir/toolchain-aarch64_cortex-a53_gcc-14.4.0_musl
+  #   然后 bootstrap 的 sanity 检查会去找那个 gcc，找不到就 panic：
+  #     couldn't find required command: "aarch64-openwrt-linux-musl-gcc"
+  #   即 rust 的 host 构建**依赖 make toolchain/install**，不是纯 host 工具。
+  #
+  #   这里提前查，缺了就明确告警并跳过 rust，而不是让它 panic 后
+  #   再单线程重试一遍（两种失败信息都一样，日志里很难分辨）。
+  # ---------------------------------------------------------------
+  if [ "$HAS_RUST" = "true" ]; then
+    if ls staging_dir/toolchain*/bin/*-gcc >/dev/null 2>&1; then
+      echo "target 交叉编译器: $(ls staging_dir/toolchain*/bin/*-gcc 2>/dev/null | head -1)"
+    else
+      echo "::warning::没有 target 交叉编译器（staging_dir/toolchain*/bin/*-gcc）"
+      echo "::warning::rust 的 host 构建需要它 —— 请先跑 make toolchain/install"
+      echo "::warning::本次跳过 rust，仅编 golang（golang 不需要它）"
+      HAS_RUST=false
+    fi
+  fi
+
   # bootstrap 只在 CONFIG_GOLANG_BUILD_BOOTSTRAP=y 时才有意义，
   # 但包在树里就先编，make 自己会按依赖决定要不要用
   [ -n "$GO_BOOT_REL" ] && compile_host "golang-bootstrap" "$GO_BOOT_REL"
   [ "$HAS_GO" = "true" ] && compile_host "golang" "$GO_REL"
   [ "$HAS_RUST" = "true" ] && compile_host "rust" "$RUST_REL"
 
-  # 收尾再判一次：没有任何产物就当失败，避免 pack 出空包、污染缓存
-  if [ "$FAIL" = "0" ] && ! host_artifacts_present; then
-    echo "::warning::三个包都跑完了，staging_dir/host 里仍然什么都没有"
+  # ---------------------------------------------------------------
+  # ★ 部分成功也算成功。
+  #
+  #   golang bootstrap 是最贵的那一段（40~70 分钟，go1.4→1.17→1.20→1.22→1.24
+  #   五段自举）。如果它编成了、只是 rust 失败，把结果丢掉等于下次重付一遍
+  #   全部时间。所以判据改成「有没有产物」，而不是「有没有包失败」：
+  #     有产物 → host_build_failed=false，pack 照常收（下次 golang 直接命中）
+  #     无产物 → 才置 true，不写缓存
+  # ---------------------------------------------------------------
+  if ! host_artifacts_present; then
+    echo "::warning::三个包都跑完了，staging_dir/host* 里仍然什么都没有"
     dump_diag "host 编译"
     FAIL=1
+  elif [ "$FAIL" != "0" ]; then
+    echo "::warning::部分包编译失败，但已有产物 —— 仍会打包缓存（下次可省下已完成的部分）"
+    FAIL=0
   fi
 
   if [ "$FAIL" != "0" ]; then
@@ -282,7 +325,8 @@ pack)
   [ -n "$KEY" ] || { echo "::error::缺 HOST_CACHE_KEY" >&2; exit 1; }
 
   # 只收存在的文件：缺哪个都不让 tar 失败。
-  # ⚠ staging_dir/host 与 staging_dir/hostpkg 两套都要收（见 host_stage_dirs 的说明）
+  # ⚠ 三处 host 目录都要收（见 host_stage_dirs 的说明）：
+  #   host / hostpkg / target-*/host —— golang 在 hostpkg，rust 在 target-*/host
   LIST=$(mktemp)
   for d in $(host_stage_dirs); do
     # 1) stamp —— 决定下次 make 会不会重编，最重要
@@ -294,9 +338,10 @@ pack)
     done
     find "$d/lib" -maxdepth 1 \( -name 'go' -o -name 'go-*' -o -name 'rustlib' \) 2>/dev/null >> "$LIST"
     find "$d/libexec" -maxdepth 1 -name 'gcc-*' 2>/dev/null >> "$LIST"
-    # 3) hostpkg 的 go 还可能带一个 pkg 子目录（工具链本体）
+    # 3) go 的工具链本体（如 lib/go-1.24.13、pkg）
     find "$d" -maxdepth 2 -type d -name 'go-1*' 2>/dev/null >> "$LIST"
   done
+  # 注：rustlib 是目录，tar 会自动递归，不用再列一遍
   # 4) 可选：构建树（默认关，rust 的构建树太大）
   if [ "$HOST_INCLUDE_BUILDDIR" = "true" ]; then
     find build_dir/host build_dir/hostpkg -maxdepth 1 \
