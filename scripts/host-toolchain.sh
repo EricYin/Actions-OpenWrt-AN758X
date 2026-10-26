@@ -183,6 +183,38 @@ need_stack() { # $1=golang-package.mk|rust-package.mk
 }
 
 # ---------------------------------------------------------------
+# 判断本次需要哪些 host 语言栈。
+#
+#   两种模式：
+#     FORCE_ALL_STACKS=true  → 树里有的全编（独立 workflow 用）
+#     FORCE_ALL_STACKS=false → 只看本次机型真正选中的（主流程用）
+#
+#   ★ 为什么独立流程必须「全编」：
+#     它用的是 configs/<soc>.config 这种 subtarget 级基础配置，
+#     里面一个 Go/Rust 包都没有（实测 an7581.config 的
+#     CONFIG_PACKAGE_h3c-fttr-tools=0）。按需判断会得出
+#     「无需 golang、无需 rust」→ 什么都不编 → 缓存是空的。
+#     而真正需要 Rust 的是机型配置 h3c_hm2004-du.config
+#     （CONFIG_PACKAGE_h3c-fttr-tools=y，全仓唯一一个）。
+#     两头落空：编的用不上，需要的没编。
+#
+#     host 工具链总共就 golang / rust 两个，编全了就能服务
+#     该 subtarget 下的所有机型，没必要按机型裁剪。
+# ---------------------------------------------------------------
+resolve_stacks() { # 设置 NEED_GO / NEED_RUST
+  if [ "${FORCE_ALL_STACKS:-false}" = "true" ]; then
+    NEED_GO="$HAS_GO"
+    NEED_RUST="$HAS_RUST"
+    echo "    FORCE_ALL_STACKS=true → 树里有的全编（golang=$NEED_GO rust=$NEED_RUST）"
+    return 0
+  fi
+
+  echo "----- 判断本次机型真正需要哪些 host 语言栈 -----"
+  if need_stack golang-package.mk; then NEED_GO=true;   else NEED_GO=false;   echo "    无需 golang（没有选中的 Go 包）"; fi
+  if need_stack rust-package.mk;   then NEED_RUST=true; else NEED_RUST=false; echo "    无需 rust（没有选中的 Rust 包）"; fi
+}
+
+# ---------------------------------------------------------------
 # 单个包的产物是否已在位。
 #
 #   ★ 这条是「缓存缺口」的关键。host 缓存可能只有一半：
@@ -335,9 +367,8 @@ build)
   #     - HAS_PAT=false 时私有仓库拉不下来，h3c-fttr-tools（唯一的 Rust 包）
   #       根本不在树里，rustc 也照样编了一遍。
   # ================================================================
-  echo "----- 判断本次真正需要哪些 host 语言栈 -----"
-  if need_stack golang-package.mk; then NEED_GO=true;   else NEED_GO=false;   echo "    无需 golang（没有选中的 Go 包）"; fi
-  if need_stack rust-package.mk;   then NEED_RUST=true; else NEED_RUST=false; echo "    无需 rust（没有选中的 Rust 包）"; fi
+  echo "----- 判断本次需要哪些 host 语言栈 -----"
+  resolve_stacks
 
   if [ "$NEED_GO" = "false" ] && [ "$NEED_RUST" = "false" ]; then
     echo "::warning::本次机型没有任何 Go / Rust 包，host 工具链缓存无意义，跳过"
@@ -417,9 +448,8 @@ build)
 #     有缺口   → 正常装工具链（rust 缺口还要交叉编译器）再编
 # ---------------------------------------------------------------
 check)
-  echo "----- 本次机型需要的 host 语言栈 -----"
-  if need_stack golang-package.mk; then NEED_GO=true;   else NEED_GO=false;   echo "    无需 golang"; fi
-  if need_stack rust-package.mk;   then NEED_RUST=true; else NEED_RUST=false; echo "    无需 rust";   fi
+  echo "----- 本次需要的 host 语言栈 -----"
+  resolve_stacks
 
   GO_MISSING=false; RUST_MISSING=false
   if [ "$NEED_GO" = "true" ] && ! pkg_has_artifacts golang;   then GO_MISSING=true;   fi
