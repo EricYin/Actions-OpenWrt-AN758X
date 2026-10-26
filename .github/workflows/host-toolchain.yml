@@ -345,7 +345,20 @@ jobs:
             bash "$GITHUB_WORKSPACE/scripts/host-toolchain.sh" unpack "$BUILD_ROOT/openwrt"
 
       # =========================================================
-      # 8. 工具链 —— 只在 host 缓存未命中时才需要
+      # 7.5 算出「还缺什么」—— 决定后面要不要装工具链
+      #
+      #   不能一刀切用 unpacked 判断：缓存可能只有一半
+      #   （上次 golang 编成了、rust 因缺交叉编译器失败）。
+      #   那种情况下 unpacked=true 但 rust 一直没人编，缺口永远补不上。
+      # =========================================================
+      - name: Check what still needs building
+        id: host-need
+        run: |
+          cd "$BUILD_ROOT/openwrt"
+          bash "$GITHUB_WORKSPACE/scripts/host-toolchain.sh" check "$BUILD_ROOT/openwrt"
+
+      # =========================================================
+      # 8. 工具链 —— 只在真的还要编时才需要
       #
       #    host gcc（staging_dir/host/bin/gcc）来源三条，按优先级：
       #      a) actions/cache        —— 几十秒，但 7 天未命中即淘汰
@@ -365,7 +378,7 @@ jobs:
       # =========================================================
       - name: Generate toolchain cache key (for reuse)
         id: tc-key
-        if: steps.host-unpack.outputs.unpacked != 'true'
+        if: steps.host-need.outputs.NEED_ANY_BUILD == 'true'
         run: |
           cd "$BUILD_ROOT/openwrt"
           TARGET=$(grep '^CONFIG_TARGET_BOARD=' .config | cut -d'"' -f2)
@@ -377,7 +390,7 @@ jobs:
 
       - name: Restore toolchain from actions/cache
         id: tc-restore
-        if: env.REUSE_TOOLCHAIN == 'true' && steps.host-unpack.outputs.unpacked != 'true'
+        if: env.REUSE_TOOLCHAIN == 'true' && steps.host-need.outputs.NEED_ANY_BUILD == 'true'
         uses: actions/cache/restore@v5
         continue-on-error: true
         with:
@@ -395,7 +408,7 @@ jobs:
         id: tc-release-restore
         if: >-
           env.REUSE_TOOLCHAIN == 'true'
-          && steps.host-unpack.outputs.unpacked != 'true'
+          && steps.host-need.outputs.NEED_ANY_BUILD == 'true'
           && steps.tc-restore.outputs.cache-hit != 'true'
         continue-on-error: true
         env:
@@ -441,7 +454,7 @@ jobs:
 
       - name: Install host tools
         if: >-
-          steps.host-unpack.outputs.unpacked != 'true'
+          steps.host-need.outputs.NEED_ANY_BUILD == 'true'
           && (env.REUSE_TOOLCHAIN != 'true'
               || (steps.tc-restore.outputs.cache-hit != 'true'
                   && steps.tc-release-restore.outputs.restored != 'true'))
@@ -457,8 +470,7 @@ jobs:
 
       - name: Install target toolchain (only if rust present)
         if: >-
-          steps.host-unpack.outputs.unpacked != 'true'
-          && steps.host-key.outputs.HAS_RUST == 'true'
+          steps.host-need.outputs.NEED_CROSS_COMPILER == 'true'
           && (env.REUSE_TOOLCHAIN != 'true'
               || (steps.tc-restore.outputs.cache-hit != 'true'
                   && steps.tc-release-restore.outputs.restored != 'true'))
@@ -473,7 +485,7 @@ jobs:
           touch toolchain/stamp-compile 2>/dev/null || true
 
       - name: Verify host gcc
-        if: steps.host-unpack.outputs.unpacked != 'true'
+        if: steps.host-need.outputs.NEED_ANY_BUILD == 'true'
         run: |
           cd "$BUILD_ROOT/openwrt"
           if [ ! -x staging_dir/host/bin/gcc ]; then
@@ -487,7 +499,6 @@ jobs:
       # =========================================================
       - name: Build host Go / Rust toolchain
         id: host-build
-        if: steps.host-unpack.outputs.unpacked != 'true'
         run: |
           cd "$BUILD_ROOT/openwrt"
           JOBS=$(awk -v p="$(nproc)" '/^MemAvailable:/{m=int($2/2097152)+1} END{print m<p?m:p}' /proc/meminfo)
@@ -499,7 +510,7 @@ jobs:
 
       - name: Pack host toolchain
         id: host-pack
-        if: steps.host-unpack.outputs.unpacked != 'true' && steps.host-build.outputs.host_build_failed == 'false'
+        if: steps.host-build.outputs.host_build_failed == 'false'
         run: |
           cd "$BUILD_ROOT/openwrt"
           HOST_CACHE_KEY='${{ steps.host-key.outputs.HOST_CACHE_KEY }}' \
@@ -511,8 +522,8 @@ jobs:
       # =========================================================
       - name: Save host toolchain to actions/cache
         if: >-
-          (steps.host-unpack.outputs.unpacked != 'true' && steps.host-pack.outputs.packed == 'true')
-          || (steps.host-unpack.outputs.unpacked != 'true' && steps.host-release-restore.outputs.restored == 'true')
+          steps.host-pack.outputs.packed == 'true'
+          || steps.host-release-restore.outputs.restored == 'true'
         uses: actions/cache/save@v5
         continue-on-error: true
         with:

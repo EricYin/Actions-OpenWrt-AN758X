@@ -1118,7 +1118,6 @@ jobs:
         if: >-
           env.USE_HOST_TOOLCHAIN_CACHE == 'true'
           && steps.host-cache-key.outputs.skip != 'true'
-          && steps.host-unpack.outputs.unpacked != 'true'
         run: |
           cd "$BUILD_ROOT/openwrt"
           JOBS=$(awk -v p="$(nproc)" '/^MemAvailable:/{m=int($2/2097152)+1} END{print m<p?m:p}' /proc/meminfo)
