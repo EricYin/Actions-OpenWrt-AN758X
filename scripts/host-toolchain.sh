@@ -131,6 +131,22 @@ out() { # 同时写 GITHUB_OUTPUT（CI 里）和 stdout
   [ -n "${GITHUB_OUTPUT:-}" ] && echo "$1" >> "$GITHUB_OUTPUT"
 }
 
+# ---------------------------------------------------------------
+# host 产物的安放位置有两套：
+#   staging_dir/host      —— 普通 host 包（tools/ 那类）
+#   staging_dir/hostpkg   —— 用 HostBuild 编译的 package/ 包
+#
+#   实测 ponwrt 的 golang / golang-bootstrap 构建目录是
+#   build_dir/hostpkg/go-<ver>，装进去的位置多半也是 hostpkg。
+#   只盯着 staging_dir/host 的话，编了两小时最后还是「没有产物可打包」。
+#   所以这里把两边的 bin / lib / stamp 都纳入，哪个存在收哪个。
+# ---------------------------------------------------------------
+host_stage_dirs() {
+  for d in staging_dir/host staging_dir/hostpkg; do
+    [ -d "$d" ] && printf '%s\n' "$d"
+  done
+}
+
 case "$SUBCMD" in
 
 # ---------------------------------------------------------------
@@ -177,27 +193,34 @@ build)
   #   没有 HostBuild 定义 / target 名不对时，make 都会安静地返回 0。
   #   所以退出码之外必须再看一眼产物。
   host_artifacts_present() {
-    [ -e staging_dir/host/bin/go ]    && return 0
-    [ -e staging_dir/host/bin/rustc ] && return 0
-    [ -e staging_dir/host/bin/cargo ] && return 0
-    find staging_dir/host/stamp -maxdepth 1 -type f \
-      \( -name '.golang*' -o -name '.rust*' -o -name '.go-bootstrap*' \) 2>/dev/null \
-      | grep -q . && return 0
+    local d
+    for d in $(host_stage_dirs); do
+      [ -e "$d/bin/go" ]    && return 0
+      [ -e "$d/bin/rustc" ] && return 0
+      [ -e "$d/bin/cargo" ] && return 0
+      find "$d/stamp" -maxdepth 1 -type f \
+        \( -name '.golang*' -o -name '.rust*' -o -name '.go-bootstrap*' \) 2>/dev/null \
+        | grep -q . && return 0
+    done
     return 1
   }
 
   dump_diag() { # $1=场合说明
-    echo "::warning::$1：make 返回 0，但 staging_dir/host 里没有 go / rustc / stamp"
+    local d
+    echo "::warning::$1：make 返回 0，但 staging_dir/host* 里没有 go / rustc / stamp"
     echo "  --- 诊断 ---"
-    echo "  1) host bin 里的相关文件:"
-    ls -1 staging_dir/host/bin 2>/dev/null | grep -iE '^(go|gofmt|rustc|cargo|rustdoc)$' \
-      | sed 's/^/     /' || echo "     (bin 目录为空或不存在)"
-    echo "  2) host stamp 里的相关文件:"
-    ls -1 staging_dir/host/stamp 2>/dev/null | grep -iE 'golang|rust|go-bootstrap' | head -10 \
-      | sed 's/^/     /' || echo "     (无)"
-    echo "  3) host stamp 总数: $(ls -1 staging_dir/host/stamp 2>/dev/null | wc -l)"
-    echo "  4) build_dir/host 下的目录:"
-    ls -d build_dir/host/* 2>/dev/null | head -5 | sed 's/^/     /' || echo "     (无)"
+    for d in $(host_stage_dirs); do
+      echo "  [$d]"
+      echo "    bin 里的相关文件:"
+      ls -1 "$d/bin" 2>/dev/null | grep -iE '^(go|gofmt|rustc|cargo|rustdoc)$' \
+        | sed 's/^/       /' || echo "       (空或不存在)"
+      echo "    stamp 里 go/rust 相关:"
+      ls -1 "$d/stamp" 2>/dev/null | grep -iE 'golang|rust|go-bootstrap' | head -10 \
+        | sed 's/^/       /' || echo "       (无)"
+      echo "    stamp 总数: $(ls -1 "$d/stamp" 2>/dev/null | wc -l)"
+    done
+    echo "  4) build_dir 下的构建树:"
+    ls -d build_dir/host/* build_dir/hostpkg/* 2>/dev/null | head -8 | sed 's/^/     /' || echo "     (无)"
     echo "  5) dl 里的 go/rust 源码包:"
     ls -1 dl 2>/dev/null | grep -iE '^(go|rust)' | head -5 | sed 's/^/     /' || echo "     (无)"
   }
@@ -258,23 +281,30 @@ pack)
   KEY="${HOST_CACHE_KEY:-}"
   [ -n "$KEY" ] || { echo "::error::缺 HOST_CACHE_KEY" >&2; exit 1; }
 
-  # 只收存在的文件：缺哪个都不让 tar 失败
+  # 只收存在的文件：缺哪个都不让 tar 失败。
+  # ⚠ staging_dir/host 与 staging_dir/hostpkg 两套都要收（见 host_stage_dirs 的说明）
   LIST=$(mktemp)
-  # 1) stamp —— 决定下次 make 会不会重编，最重要
-  find staging_dir/host/stamp -maxdepth 1 -type f \
-       \( -name '.golang*' -o -name '.rust*' -o -name '.go-bootstrap*' \) 2>/dev/null >> "$LIST"
-  # 2) 装进 host 的二进制与库
-  for f in staging_dir/host/bin/go staging_dir/host/bin/gofmt \
-           staging_dir/host/bin/rustc staging_dir/host/bin/cargo \
-           staging_dir/host/bin/rustdoc; do
-    [ -e "$f" ] && echo "$f" >> "$LIST"
+  for d in $(host_stage_dirs); do
+    # 1) stamp —— 决定下次 make 会不会重编，最重要
+    find "$d/stamp" -maxdepth 1 -type f \
+         \( -name '.golang*' -o -name '.rust*' -o -name '.go-bootstrap*' \) 2>/dev/null >> "$LIST"
+    # 2) 装进 host 的二进制与库
+    for b in go gofmt rustc cargo rustdoc; do
+      [ -e "$d/bin/$b" ] && echo "$d/bin/$b" >> "$LIST"
+    done
+    find "$d/lib" -maxdepth 1 \( -name 'go' -o -name 'go-*' -o -name 'rustlib' \) 2>/dev/null >> "$LIST"
+    find "$d/libexec" -maxdepth 1 -name 'gcc-*' 2>/dev/null >> "$LIST"
+    # 3) hostpkg 的 go 还可能带一个 pkg 子目录（工具链本体）
+    find "$d" -maxdepth 2 -type d -name 'go-1*' 2>/dev/null >> "$LIST"
   done
-  find staging_dir/host/lib -maxdepth 1 \( -name 'go' -o -name 'go-*' -o -name 'rustlib' \) 2>/dev/null >> "$LIST"
-  find staging_dir/host/libexec -maxdepth 1 -name 'gcc-*' 2>/dev/null >> "$LIST"
-  # 3) 可选：build_dir（默认关，rust 的构建树太大）
+  # 4) 可选：构建树（默认关，rust 的构建树太大）
   if [ "$HOST_INCLUDE_BUILDDIR" = "true" ]; then
-    find build_dir/host -maxdepth 1 \( -name 'golang*' -o -name 'go-bootstrap*' -o -name 'rust*' \) 2>/dev/null >> "$LIST"
+    find build_dir/host build_dir/hostpkg -maxdepth 1 \
+         \( -name 'golang*' -o -name 'go-*' -o -name 'go-bootstrap*' -o -name 'rust*' \) 2>/dev/null >> "$LIST"
   fi
+
+  # 去重（两套目录可能同时命中同一文件）
+  sort -u "$LIST" -o "$LIST"
 
   if [ ! -s "$LIST" ]; then
     echo "::warning::没有任何 host 产物可打包（go/rust 都没编出来？）"
@@ -318,14 +348,21 @@ unpack)
 
   # tar 会还原 mtime，但解压后 stamp 相对 feeds/Makefile 的新旧关系不保证，
   # 统一 touch 一遍，确保 make 认定 host 包已装、不再重编。
-  find staging_dir/host/stamp -maxdepth 1 -type f \
-       \( -name '.golang*' -o -name '.rust*' -o -name '.go-bootstrap*' \) \
-       -exec touch {} + 2>/dev/null || true
+  # 两套目录都要处理：host 和 hostpkg 各有各的 stamp
+  while read -r d; do
+    find "$d/stamp" -maxdepth 1 -type f \
+         \( -name '.golang*' -o -name '.rust*' -o -name '.go-bootstrap*' \) \
+         -exec touch {} + 2>/dev/null || true
+  done < <(host_stage_dirs)
 
   # 解出来却没有任何 host 二进制 = 这份缓存是空的，别让 make 以为装好了
-  if ! ls staging_dir/host/bin/go staging_dir/host/bin/rustc >/dev/null 2>&1; then
+  FOUND=0
+  for d in $(host_stage_dirs); do
+    [ -e "$d/bin/go" ] || [ -e "$d/bin/rustc" ] && FOUND=1
+  done
+  if [ "$FOUND" != "1" ]; then
     echo "unpacked=false" >> "${GITHUB_OUTPUT:-/dev/null}"
-    echo "::warning::解压后 staging_dir/host/bin 里没有 go / rustc，视为无效缓存"
+    echo "::warning::解压后 staging_dir/host*/bin 里没有 go / rustc，视为无效缓存"
     exit 0
   fi
 
@@ -338,10 +375,13 @@ status)
   {
     echo "golang: $GO_VER ($HAS_GO)"
     echo "rust:   $RUST_VER ($HAS_RUST)"
-    for b in go gofmt rustc cargo rustdoc; do
-      if [ -e "staging_dir/host/bin/$b" ]; then
-        printf '%-8s %s\n' "$b" "$(staging_dir/host/bin/$b --version 2>&1 | head -1)"
-      fi
+    for d in $(host_stage_dirs); do
+      echo "-- $d --"
+      for b in go gofmt rustc cargo rustdoc; do
+        if [ -e "$d/bin/$b" ]; then
+          printf '%-8s %s\n' "$b" "$("$d/bin/$b" --version 2>&1 | head -1)"
+        fi
+      done
     done
   } | tee "$REPORT_DIR/host-toolchain.txt"
   ;;
