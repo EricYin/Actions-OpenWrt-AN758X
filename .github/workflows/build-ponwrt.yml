@@ -994,9 +994,10 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: /workdir/hosttool-cache
+          # ⚠ 故意不设 restore-keys。key 里含 go/rust 版本与包 Makefile 的
+          #   md5，前缀回退会命中「版本已经变了」的旧缓存，等于拿错版本的
+          #   rustc 去编包。版本不符就该重编，不做模糊匹配。
           key: ${{ steps.host-cache-key.outputs.HOST_CACHE_KEY }}
-          restore-keys: |
-            ${{ steps.host-cache-key.outputs.HOST_CACHE_PREFIX }}-
 
       # =========================================================
       # 12.2 恢复 host 工具链 —— 第二优先 Release 备份
