@@ -95,6 +95,11 @@ env:
   HOST_CACHE_DIR: /workdir/hosttool-cache
   HOST_INCLUDE_BUILDDIR: 'false'
   HOST_RELEASE_BACKUP: ${{ github.event.inputs.upload_release == 'false' && 'false' || 'true' }}
+  # ★ 独立流程必须全编：用的是 configs/<soc>.config 这种 subtarget 基础配置，
+  #   里面一个 Go/Rust 包都没有。按需判断会得出「什么都不用编」→ 缓存是空的。
+  #   而真正需要 Rust 的是机型配置（h3c_hm2004-du 的 h3c-fttr-tools）。
+  #   全编一份，该 subtarget 下所有机型都能用。
+  FORCE_ALL_STACKS: 'true'
   # 用 '== true' 而不是 '|| 默认值'：GitHub 表达式里非空字符串即真，
   # 'false' 不会被判为假；schedule 触发时 inputs 为 null 也要有确定值。
   FORCE_REBUILD: ${{ github.event.inputs.force == 'true' && 'true' || 'false' }}
@@ -286,6 +291,7 @@ jobs:
           dos2unix "$SCRIPT" 2>/dev/null || true
           chmod +x "$SCRIPT"
           HOST_INCLUDE_BUILDDIR="$HOST_INCLUDE_BUILDDIR" \
+          FORCE_ALL_STACKS="$FORCE_ALL_STACKS" \
             bash "$SCRIPT" key "$BUILD_ROOT/openwrt"
 
       # =========================================================
@@ -355,7 +361,8 @@ jobs:
         id: host-need
         run: |
           cd "$BUILD_ROOT/openwrt"
-          bash "$GITHUB_WORKSPACE/scripts/host-toolchain.sh" check "$BUILD_ROOT/openwrt"
+          FORCE_ALL_STACKS="$FORCE_ALL_STACKS" \
+            bash "$GITHUB_WORKSPACE/scripts/host-toolchain.sh" check "$BUILD_ROOT/openwrt"
 
       # =========================================================
       # 8. 工具链 —— 只在真的还要编时才需要
@@ -505,6 +512,7 @@ jobs:
           JOBS=$(( JOBS < 1 ? 1 : JOBS ))
           HOST_CACHE_KEY='${{ steps.host-key.outputs.HOST_CACHE_KEY }}' \
           HOST_INCLUDE_BUILDDIR="$HOST_INCLUDE_BUILDDIR" \
+          FORCE_ALL_STACKS="$FORCE_ALL_STACKS" \
           JOBS="$JOBS" \
             bash "$GITHUB_WORKSPACE/scripts/host-toolchain.sh" build "$BUILD_ROOT/openwrt"
 
