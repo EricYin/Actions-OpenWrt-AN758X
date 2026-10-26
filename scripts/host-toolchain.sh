@@ -211,18 +211,27 @@ unpack)
   fi
   which unzstd >/dev/null 2>&1 || sudo -E apt-get -yqq install zstd >/dev/null 2>&1 || true
 
-  if tar -I unzstd -xf "$TARBALL"; then
-    # tar 会还原 mtime，但解压后 stamp 相对 feeds/Makefile 的新旧关系不保证，
-    # 统一 touch 一遍，确保 make 认定 host 包已装、不再重编。
-    find staging_dir/host/stamp -maxdepth 1 -type f \
-         \( -name '.golang*' -o -name '.rust*' -o -name '.go-bootstrap*' \) \
-         -exec touch {} + 2>/dev/null || true
-    echo "restored=true" >> "${GITHUB_OUTPUT:-/dev/null}"
-    echo "✅ host 工具链已从缓存恢复"
-  else
-    echo "restored=false" >> "${GITHUB_OUTPUT:-/dev/null}"
+  if ! tar -I unzstd -xf "$TARBALL"; then
+    echo "unpacked=false" >> "${GITHUB_OUTPUT:-/dev/null}"
     echo "::warning::host 工具链解压失败，将走真实编译"
+    exit 0
   fi
+
+  # tar 会还原 mtime，但解压后 stamp 相对 feeds/Makefile 的新旧关系不保证，
+  # 统一 touch 一遍，确保 make 认定 host 包已装、不再重编。
+  find staging_dir/host/stamp -maxdepth 1 -type f \
+       \( -name '.golang*' -o -name '.rust*' -o -name '.go-bootstrap*' \) \
+       -exec touch {} + 2>/dev/null || true
+
+  # 解出来却没有任何 host 二进制 = 这份缓存是空的，别让 make 以为装好了
+  if ! ls staging_dir/host/bin/go staging_dir/host/bin/rustc >/dev/null 2>&1; then
+    echo "unpacked=false" >> "${GITHUB_OUTPUT:-/dev/null}"
+    echo "::warning::解压后 staging_dir/host/bin 里没有 go / rustc，视为无效缓存"
+    exit 0
+  fi
+
+  echo "unpacked=true" >> "${GITHUB_OUTPUT:-/dev/null}"
+  echo "✅ host 工具链已从缓存恢复"
   ;;
 
 # ---------------------------------------------------------------
