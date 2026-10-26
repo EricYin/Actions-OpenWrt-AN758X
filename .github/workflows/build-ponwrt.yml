@@ -30,7 +30,8 @@ env:
   # true 时连 build_dir/host 一起打包（rust 构建树动辄 5~10GB，默认关）
   HOST_INCLUDE_BUILDDIR: 'false'
   # 除 actions/cache 外，是否再往 Release 存一份（同 toolchain-cache 的双通道）
-  HOST_RELEASE_BACKUP: 'true'
+  #   '0' 不能用 '||' 兜（GitHub 表达式里字符串 '0' 会转数字判假），统一 '== '1''。
+  HOST_RELEASE_BACKUP: ${{ github.event.inputs.host_release_backup == 'false' && 'false' || 'true' }}
   TZ: Asia/Shanghai
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   REPO_BRANCH: ${{ github.event.inputs.branch || 'master' }}
@@ -199,6 +200,14 @@ on:
       # 触发，那种触发下 boolean 输入拿不到值会退化成空串。
       use_host_toolchain_cache:
         description: '缓存 host 侧 go-bootstrap / rustc（关 = 每次重编）'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      host_release_backup:
+        description: 'host 工具链额外存一份到 Release（actions/cache 7 天未命中会淘汰，Release 不会）'
         required: false
         default: 'true'
         type: choice
@@ -829,10 +838,17 @@ jobs:
         if: env.USE_HOST_TOOLCHAIN_CACHE == 'true'
         run: |
           cd "$BUILD_ROOT/openwrt"
-          dos2unix "$GITHUB_WORKSPACE/scripts/host-toolchain.sh" 2>/dev/null || true
-          chmod +x "$GITHUB_WORKSPACE/scripts/host-toolchain.sh"
+          SCRIPT="$GITHUB_WORKSPACE/scripts/host-toolchain.sh"
+          # 脚本没入仓时只 warning 跳过，绝不让构建死在 chmod 上
+          if [ ! -f "$SCRIPT" ]; then
+            echo "::warning::缺 $SCRIPT，本次跳过 host 工具链缓存（走常规编译）"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          dos2unix "$SCRIPT" 2>/dev/null || true
+          chmod +x "$SCRIPT"
           HOST_INCLUDE_BUILDDIR="$HOST_INCLUDE_BUILDDIR" \
-            bash "$GITHUB_WORKSPACE/scripts/host-toolchain.sh" key "$BUILD_ROOT/openwrt"
+            bash "$SCRIPT" key "$BUILD_ROOT/openwrt"
 
       
       # =========================================================
@@ -971,7 +987,10 @@ jobs:
       # =========================================================
       - name: Restore host toolchain from actions/cache
         id: host-cache-restore
-        if: env.USE_HOST_TOOLCHAIN_CACHE == 'true' && env.IGNORE_CACHE != 'true'
+        if: >-
+          env.USE_HOST_TOOLCHAIN_CACHE == 'true'
+          && env.IGNORE_CACHE != 'true'
+          && steps.host-cache-key.outputs.skip != 'true'
         uses: actions/cache/restore@v5
         with:
           path: /workdir/hosttool-cache
@@ -983,6 +1002,10 @@ jobs:
       # 12.2 恢复 host 工具链 —— 第二优先 Release 备份
       #     同项目里 toolchain-cache 的做法：actions/cache 有 7 天未命中即淘汰，
       #     Release 资产不会，当长期兜底。命中后回写 actions/cache。
+      #
+      #     ⚠ 这里只负责把 <KEY>.tzst 下载到 $HOST_CACHE_DIR，不解压。
+      #       解压统一交给下一步 12.3 —— 否则 actions/cache 命中时
+      #       （本步被 cache-hit != 'true' 挡住）没人解压，等于白命中。
       # =========================================================
       - name: Restore host toolchain from Release backup
         id: host-release-restore
@@ -990,6 +1013,7 @@ jobs:
           env.USE_HOST_TOOLCHAIN_CACHE == 'true'
           && env.IGNORE_CACHE != 'true'
           && env.HOST_RELEASE_BACKUP == 'true'
+          && steps.host-cache-key.outputs.skip != 'true'
           && steps.host-cache-restore.outputs.cache-hit != 'true'
         continue-on-error: true
         env:
@@ -997,7 +1021,6 @@ jobs:
         run: |
           cd "$BUILD_ROOT/openwrt"
           KEY="${{ steps.host-cache-key.outputs.HOST_CACHE_KEY }}"
-          PREFIX="${{ steps.host-cache-key.outputs.HOST_CACHE_PREFIX }}"
           [ -z "$KEY" ] && { echo "restored=false" >> "$GITHUB_OUTPUT"; exit 0; }
 
           mkdir -p "$HOST_CACHE_DIR"
@@ -1007,30 +1030,59 @@ jobs:
             exit 0
           fi
 
-          which unzstd >/dev/null 2>&1 || sudo -E apt-get -yqq install zstd >/dev/null 2>&1 || true
-
           ASSET="${KEY}.tzst"
           if gh release view hosttool-cache --repo "$GITHUB_REPOSITORY" \
                --json assets -q '.assets[].name' 2>/dev/null | grep -qx "$ASSET"; then
             gh release download hosttool-cache --repo "$GITHUB_REPOSITORY" -p "$ASSET" -D "$HOST_CACHE_DIR"
-            HOST_CACHE_KEY="$KEY" \
-              bash "$GITHUB_WORKSPACE/scripts/host-toolchain.sh" unpack "$BUILD_ROOT/openwrt"
-            echo "restored=true"    >> "$GITHUB_OUTPUT"
+            echo "restored=true"        >> "$GITHUB_OUTPUT"
             echo "need_save_cache=true" >> "$GITHUB_OUTPUT"
+            echo "✅ 已从 Release 下载 host 工具链: $ASSET"
           else
             echo "restored=false" >> "$GITHUB_OUTPUT"
             echo "Release 中无匹配的 host 工具链缓存（同前缀旧资产不复用：版本变了就重编）"
           fi
 
       # =========================================================
-      # 12.3 真编译 host 侧 go(-bootstrap) / rust
+      # 12.3 解压 host 工具链（两种来源统一在这里落地）
+      #
+      #   ★ 这一步是必须的。actions/cache / Release 恢复出来的都只是
+      #     $HOST_CACHE_DIR/<KEY>.tzst 这个文件，staging_dir 里还没有
+      #     任何 go / rustc / stamp。不解压的话 make 照样从头编一遍，
+      #     缓存等于没命中。
+      #
+      #   解压完会 touch 一遍 stamp，确保 make 认定 host 包已装。
+      #   解压失败只 warning，回落真编译。
+      # =========================================================
+      - name: Unpack host toolchain
+        id: host-unpack
+        if: >-
+          env.USE_HOST_TOOLCHAIN_CACHE == 'true'
+          && env.IGNORE_CACHE != 'true'
+          && steps.host-cache-key.outputs.skip != 'true'
+        run: |
+          cd "$BUILD_ROOT/openwrt"
+          KEY="${{ steps.host-cache-key.outputs.HOST_CACHE_KEY }}"
+          TARBALL="$HOST_CACHE_DIR/${KEY}.tzst"
+          if [ ! -f "$TARBALL" ]; then
+            echo "unpacked=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::$TARBALL 不存在，将走真实编译"
+            exit 0
+          fi
+          HOST_CACHE_KEY="$KEY" \
+            bash "$GITHUB_WORKSPACE/scripts/host-toolchain.sh" unpack "$BUILD_ROOT/openwrt"
+
+      # =========================================================
+      # 12.4 真编译 host 侧 go(-bootstrap) / rust
       #
       #   只跑 <pkg>/host/compile，不碰任何 target 侧的东西。
       #   JOBS 按可用内存算，与步骤 18 同一个口径（每个 cc1 约 1.5-2G RSS）。
       #
+      #   条件只看上一步有没有解压成功，不再分别看 cache-hit / restored ——
+      #   来源是两个通道、但落地只有 unpack 一条路，判断单一化不容易漏。
+      #
       #   ⚠ 编译失败只 ::warning:: 并置 host_build_failed=true：
       #     不写缓存、也不阻断 —— 后面步骤 18 的 make 会自己再编一遍，
-      #     失败原因照常在那一���暴露。绝不因缓存逻辑让构建多一个失败点。
+      #     失败原因照常在那一处暴露。绝不因缓存逻辑让构建多一个失败点。
       #
       #   toolchain-only 时同样执行：那一档本来就是用来预热缓存的。
       # =========================================================
@@ -1038,8 +1090,8 @@ jobs:
         id: host-build
         if: >-
           env.USE_HOST_TOOLCHAIN_CACHE == 'true'
-          && steps.host-cache-restore.outputs.cache-hit != 'true'
-          && steps.host-release-restore.outputs.restored != 'true'
+          && steps.host-cache-key.outputs.skip != 'true'
+          && steps.host-unpack.outputs.unpacked != 'true'
         run: |
           cd "$BUILD_ROOT/openwrt"
           JOBS=$(awk -v p="$(nproc)" '/^MemAvailable:/{m=int($2/2097152)+1} END{print m<p?m:p}' /proc/meminfo)
@@ -1051,7 +1103,10 @@ jobs:
 
       - name: Pack host toolchain
         id: host-pack
-        if: env.USE_HOST_TOOLCHAIN_CACHE == 'true' && steps.host-build.outputs.host_build_failed == 'false'
+        if: >-
+          env.USE_HOST_TOOLCHAIN_CACHE == 'true'
+          && steps.host-cache-key.outputs.skip != 'true'
+          && steps.host-build.outputs.host_build_failed == 'false'
         run: |
           cd "$BUILD_ROOT/openwrt"
           HOST_CACHE_KEY="${{ steps.host-cache-key.outputs.HOST_CACHE_KEY }}" \
@@ -1059,13 +1114,17 @@ jobs:
             bash "$GITHUB_WORKSPACE/scripts/host-toolchain.sh" pack "$BUILD_ROOT/openwrt"
 
       # =========================================================
-      # 12.4 保存 host 工具链到 actions/cache
-      #     save-always：即使后面固件编译失败也保住，避免下次冷启动重编。
-      #     Release 命中时走 need_save_cache=true 回写快通道。
+      # 12.5 保存 host 工具链到 actions/cache
+      #     Release 命中时走 need_save_cache=true 回写快通道；
+      #     本地真编译后走 packed=true。
+      #     actions/cache 本身命中时不重复 save（key 已存在，save 会失败）。
+      #     位置在固件编译之前 + continue-on-error：即使后面固件编译失败，
+      #     host 工具链也已经存下来了，下次不用重编。
       # =========================================================
       - name: Save host toolchain to actions/cache
         if: >-
           env.USE_HOST_TOOLCHAIN_CACHE == 'true'
+          && steps.host-cache-key.outputs.skip != 'true'
           && steps.host-cache-restore.outputs.cache-hit != 'true'
           && (steps.host-pack.outputs.packed == 'true' || steps.host-release-restore.outputs.need_save_cache == 'true')
         uses: actions/cache/save@v5
@@ -1075,21 +1134,46 @@ jobs:
           key: ${{ steps.host-cache-key.outputs.HOST_CACHE_KEY }}
 
       # =========================================================
-      # 12.5 保存 host 工具链到 Release 备份（只在本地真编译后）
+      # 12.6 保存 host 工具链到 Release 备份
+      #
+      #   条件是「手上有一份有效 tzst，且它不是从 Release 来的」：
+      #     - 本地真编译 → packed=true → 上传（这是主要路径）
+      #     - actions/cache 命中 → tzst 在 HOST_CACHE_DIR 里 → 也上传，
+      #       补上「首次 Release 上传失败、但 cache 存下来了」这种漏网情况
+      #     - Release 恢复 → restored=true → 跳过，同一份文件没必要再传
+      #
+      #   ⚠ 本步 continue-on-error：Release 上传失败只是少一份长期兜底，
+      #     不该把一次能出固件的构建搞挂（与其余缓存步骤同一原则）。
+      #
+      #   ⚠ 末尾的 Remove old releases 用的是
+      #     delete_tag_pattern: ^${DEVICE_NAME}-，只匹配机型前缀，
+      #     不会误删 hosttool-cache / toolchain-cache。
       # =========================================================
       - name: Save host toolchain to Release backup
         if: >-
           env.USE_HOST_TOOLCHAIN_CACHE == 'true'
           && env.HOST_RELEASE_BACKUP == 'true'
-          && steps.host-pack.outputs.packed == 'true'
+          && steps.host-cache-key.outputs.skip != 'true'
           && steps.host-release-restore.outputs.restored != 'true'
+          && (steps.host-pack.outputs.packed == 'true' || steps.host-cache-restore.outputs.cache-hit == 'true')
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           KEY="${{ steps.host-cache-key.outputs.HOST_CACHE_KEY }}"
           PREFIX="${{ steps.host-cache-key.outputs.HOST_CACHE_PREFIX }}"
           TARBALL="$HOST_CACHE_DIR/${KEY}.tzst"
-          [ -f "$TARBALL" ] || { echo "::warning::$TARBALL 不存在，跳过 Release 备份"; exit 0; }
+          if [ ! -f "$TARBALL" ]; then
+            echo "::warning::$TARBALL 不存在，跳过 Release 备份"
+            exit 0
+          fi
+          # 空包不上传：比 1KB 还小多半是打包异常的产物
+          SZ=$(stat -c%s "$TARBALL")
+          if [ "$SZ" -lt 1024 ]; then
+            echo "::warning::$TARBALL 只有 ${SZ} 字节，视为无效缓存，跳过上传"
+            exit 0
+          fi
+          echo "上传 host 工具链到 Release: $(basename "$TARBALL") ($(du -h "$TARBALL" | cut -f1))"
 
           gh release view hosttool-cache --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
             gh release create hosttool-cache --repo "$GITHUB_REPOSITORY" \
@@ -1105,11 +1189,14 @@ jobs:
           ls -lh "$TARBALL"
 
       # =========================================================
-      # 12.6 打印 host 工具链状态（版本、是否在位）
+      # 12.7 打印 host 工具链状态（版本、是否在位）
       #      排查「到底用上缓存没有」时看这一步最快
       # =========================================================
       - name: Host toolchain status
-        if: env.USE_HOST_TOOLCHAIN_CACHE == 'true' && always()
+        if: >-
+          env.USE_HOST_TOOLCHAIN_CACHE == 'true'
+          && steps.host-cache-key.outputs.skip != 'true'
+          && always()
         continue-on-error: true
         run: |
           cd "$BUILD_ROOT/openwrt"
