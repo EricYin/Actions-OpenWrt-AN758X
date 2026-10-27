@@ -390,6 +390,46 @@ jobs:
           touch tools/stamp-compile toolchain/stamp-compile 2>/dev/null || true
 
       # =========================================================
+      # 判断是否需要重编（★ 自愈的关键）
+      #
+      #   ⚠ 原写法是「编译完再校验，缺了就 exit 1」。问题是：
+      #     staging 命中 → 跳过编译 → 校验发现缓存残缺 → exit 1 →
+      #     Pack 不跑、缓存永远修不好，下次还是命中同一份坏缓存。
+      #
+      #   改成在编译【之前】判断，并把结论交给后面的编译步骤：
+      #     need_rebuild=true  → 真编译（自愈）
+      #     need_rebuild=false → 跳过
+      #
+      #   判据是三件套齐全：host gcc、go、rustc。缺任一个就要重编。
+      # =========================================================
+      - name: Check if rebuild needed
+        id: need
+        run: |
+          cd "$BUILD_ROOT/openwrt"
+          MISSING=""
+
+          [ -x staging_dir/host/bin/gcc ] || MISSING="$MISSING gcc"
+
+          # go：OpenWrt 装在 lib/go-<ver>/bin/go，不是 bin/go
+          if ! find staging_dir -path '*/bin/go' -type f 2>/dev/null | grep -q .; then
+            MISSING="$MISSING go"
+          fi
+
+          if ! find staging_dir -path '*/bin/rustc' -type f 2>/dev/null | grep -q .; then
+            MISSING="$MISSING rustc"
+          fi
+
+          if [ -n "$MISSING" ]; then
+            echo "need_rebuild=true" >> "$GITHUB_OUTPUT"
+            echo "缺少:$MISSING → 需要重编"
+          else
+            echo "need_rebuild=false" >> "$GITHUB_OUTPUT"
+            echo "✅ 三件套齐全（gcc / go / rustc），跳过编译"
+          fi
+          staging_dir/host/bin/gcc --version 2>/dev/null | head -1 || true
+          ls -d staging_dir/toolchain* 2>/dev/null | head -2 || true
+
+      # =========================================================
       # 编译：命中就整段跳过
       #   tools/install  → host 工具（含 gcc）
       #   toolchain/install → 交叉编译器（rust 需要它）
@@ -397,7 +437,7 @@ jobs:
       # =========================================================
       - name: Build tools and toolchain
         if: >-
-          steps.staging-unpack.outputs.unpacked != 'true'
+          steps.need.outputs.need_rebuild != 'false'
           && steps.tc-restore.outputs.cache-hit != 'true'
           && steps.tc-release-restore.outputs.restored != 'true'
         run: |
@@ -411,7 +451,7 @@ jobs:
           touch tools/stamp-compile toolchain/stamp-compile 2>/dev/null || true
 
       - name: Build host golang / rust
-        if: steps.staging-unpack.outputs.unpacked != 'true'
+        if: steps.need.outputs.need_rebuild != 'false'
         run: |
           cd "$BUILD_ROOT/openwrt"
           JOBS=$(nproc)
@@ -444,16 +484,14 @@ jobs:
           done
           touch tools/stamp-compile toolchain/stamp-compile 2>/dev/null || true
 
-      - name: Verify toolchain present
-        run: |
-          cd "$BUILD_ROOT/openwrt"
-          [ -x staging_dir/host/bin/gcc ] || { echo "::error::host gcc 缺失"; exit 1; }
-          staging_dir/host/bin/gcc --version | head -1
-          ls -d staging_dir/toolchain* 2>/dev/null | head -2
 
+      # ⚠ 条件用 need_rebuild 而不是 unpacked：
+      #   staging 命中但内容残缺时 unpacked=true，按原条件会跳过打包，
+      #   于是重编出来的正确内容永远存不回去 —— 自愈失效。
+      #   只要本次真的编译过（need_rebuild != false）就该重新打包。
       - name: Pack staging dir
         id: pack
-        if: steps.staging-unpack.outputs.unpacked != 'true'
+        if: steps.need.outputs.need_rebuild != 'false'
         run: |
           cd "$BUILD_ROOT/openwrt"
           STAGING_KEY='${{ steps.fp.outputs.STAGING_KEY }}' \
