@@ -177,6 +177,20 @@ jobs:
           ln -sf "$BUILD_ROOT/openwrt" "$GITHUB_WORKSPACE/openwrt"
           cd openwrt && echo "commit: $(git rev-parse --short HEAD)"
 
+      # =========================================================
+      # ⚠ 周号必须先算成 step output。
+      #
+      #   原来直接把 $(date +%Y%W) 写进 with: key:，那是【错的】——
+      #   with: 下面没有 shell，命令替换不会执行，key 会原样变成
+      #     ponwrt-dl-pbs05/ponwrt-master-$(date +%Y%W)
+      #   于是每次都写一份名字带美元符号的垃圾条目，
+      #   与主流程真正的 ponwrt-dl-...-202644 永远对不上。
+      #   （跟之前 GO_DEFAULT_VERSION 那个坑是同一类。）
+      # =========================================================
+      - name: Compute week number
+        id: week
+        run: echo "week=$(date +%Y%W)" >> "$GITHUB_OUTPUT"
+
       # dl：长期累计。key 按周，前缀回退能拿到前几周的内容，
       # 每跑一次都把新下载的包并进去再存，于是越滚越全。
       - name: Restore dl cache
@@ -185,7 +199,7 @@ jobs:
         continue-on-error: true
         with:
           path: /workdir/openwrt/dl
-          key: ponwrt-dl-${{ env.SOURCE }}-${{ github.event.inputs.branch || 'master' }}-$(date +%Y%W)
+          key: ponwrt-dl-${{ env.SOURCE }}-${{ github.event.inputs.branch || 'master' }}-${{ steps.week.outputs.week }}
           restore-keys: |
             ponwrt-dl-${{ env.SOURCE }}-${{ github.event.inputs.branch || 'master' }}-
           save-always: true
@@ -195,7 +209,7 @@ jobs:
         continue-on-error: true
         with:
           path: /workdir/openwrt/.ccache
-          key: ponwrt-ccache-${{ matrix.soc }}-$(date +%Y%W)
+          key: ponwrt-ccache-${{ matrix.soc }}-${{ steps.week.outputs.week }}
           restore-keys: |
             ponwrt-ccache-${{ matrix.soc }}-
 
