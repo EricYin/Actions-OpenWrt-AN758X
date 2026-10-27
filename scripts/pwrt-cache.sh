@@ -54,18 +54,38 @@ staging_parts() {
 # ---------------------------------------------------------------
 # 指纹：决定「能不能整体复用」
 #
-#   与 OpenWRT-CI 的口径一致 —— 下列任一变化都换 key：
-#     上游提交 / 最终配置(.config) / feeds / 自定义包 / 构建脚本
-#   另外带上 runner 架构，避免不同 OS 之间误复用。
+#   ★ 口径必须【生产端与消费端完全一致】，否则永远命中不了。
+#     warm-cache 用 configs/<soc>.config，主流程用 configs/<机型>.config，
+#     两者内容不同 —— 所以整机 .config 绝不能进指纹。
+#
+#   只算会影响 host 工具链 / 交叉编译器 / host 侧 Go·Rust 的部分：
+#     include/ + tools/ + toolchain/ 的构建脚本
+#     feeds 里 golang / rust 的包定义
+#     feeds.conf 与各 feed 提交
+#     CI 仓的 diy-part*.sh（会改变源码树）
+#     runner 架构（避免不同 OS 误复用）
 # ---------------------------------------------------------------
 fingerprint() {
   local tmp; tmp=$(mktemp)
 
-  # 1) 上游源码提交
-  git -C "$OW" rev-parse HEAD 2>/dev/null >> "$tmp" || echo "nogit" >> "$tmp"
+  # ⚠ 口径只覆盖「会影响 host 工具链 / 交叉编译器 / host 侧 Go·Rust」的东西。
+  #   刻意【不】含整机 .config 与上游 HEAD —— 见下方说明。
 
-  # 2) 最终配置（defconfig 展开后的 .config）
-  [ -f .config ] && md5sum .config >> "$tmp"
+  # 1) 构建系统本身
+  #    include/ 变动会改变编译行为；tools/ toolchain/ 决定工具链版本。
+  #   这两项与「上游新增了什么软件包」无关，所以上游提交不会让缓存失效。
+  for d in include tools toolchain; do
+    find "$d" -type f \( -name 'Makefile' -o -name '*.mk' -o -name '*.sh' \) \
+      -exec md5sum {} + 2>/dev/null | sort -k2 >> "$tmp"
+  done
+
+  # 2) host 侧语言栈的包定义 —— 决定 golang / rustc 的版本与构建方式
+  for d in feeds/packages/lang/golang feeds/packages/lang/rust \
+           package/feeds/packages/golang package/feeds/packages/rust; do
+    [ -e "$d" ] || continue
+    find -L "$d" -maxdepth 2 -type f \
+      \( -name 'Makefile' -o -name '*.mk' \) -exec md5sum {} + 2>/dev/null | sort -k2 >> "$tmp"
+  done
 
   # 3) feeds 配置与各 feed 的提交
   for f in feeds.conf feeds.conf.default; do
@@ -79,13 +99,14 @@ fingerprint() {
     done
   fi
 
-  # 4) CI 侧的自定义脚本 / 配置 / workflow
+  # 4) CI 侧会改变源码树的脚本
+  #    ⚠ 刻意【不】算 configs/*.config：
+  #      warm-cache 用 configs/<soc>.config，主流程用 configs/<机型>.config，
+  #      两者内容必然不同。算进去的话两边 key 永远对不上，
+  #      主流程就永远命中不了 warm-cache 生成的缓存。
+  #      而机型选择只影响 target 侧包，不影响 host 工具链，本就不该进指纹。
   local ci="${GITHUB_WORKSPACE:-}"
   if [ -n "$ci" ] && [ -d "$ci" ]; then
-    find "$ci/scripts" -maxdepth 1 -type f \( -name '*.sh' -o -name '*.py' \) \
-      -exec md5sum {} + 2>/dev/null | sort -k2 >> "$tmp"
-    find "$ci/configs" -maxdepth 2 -type f -name '*.config' \
-      -exec md5sum {} + 2>/dev/null | sort -k2 >> "$tmp"
     for f in diy-part1.sh diy-part2.sh; do
       [ -f "$ci/$f" ] && md5sum "$ci/$f" >> "$tmp"
     done
