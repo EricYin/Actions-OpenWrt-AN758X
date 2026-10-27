@@ -148,6 +148,19 @@ pack)
   echo "打包 $(wc -l < "$LIST") 个顶层条目："
   sed 's/^/  /' "$LIST"
 
+  # ---------------------------------------------------------------
+  # 完整性校验：缓存必须同时含 golang 与 rustc。
+  #   静默少一个最难排查 —— 主流程会以为命中了，实际却在固件编译里现编一遍。
+  #   注意是查磁盘而不是查 $LIST：$LIST 里是顶层目录，
+  #   展开后才有 bin/rustc 这样的路径，grep 列表会漏报。
+  # ---------------------------------------------------------------
+  for want in go rustc; do
+    if find staging_dir -path "*/bin/$want" -type f 2>/dev/null | grep -q .; then
+      continue
+    fi
+    echo "::warning::staging_dir 里没有 $want —— 缓存不完整，下次该栈会重新编译"
+  done
+
   # 体积预估：zstd 对这类内容约 3 倍压缩比
   RAW_MB=0
   if command -v du >/dev/null 2>&1; then
