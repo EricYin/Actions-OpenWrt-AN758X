@@ -1,27 +1,162 @@
-name: Keep Toolchain Cache Alive
+name: Keep Build Caches Alive
 
-# actions/cache 的条目 7 天不访问会被回收，
-# 每 5 天 touch 一次工具链缓存，保证常用机型不用每次重编工具链。
+# =========================================================
+# actions/cache 的条目 7 天不访问会被回收。
+# 本流程定期 touch 一次各类缓存，保证常用机型不用每次重编。
+#
+# ⚠ 改过两版，前两版都不生效（原因见各步骤注释）。现在这一版用
+#   「先枚举出精确 key，再逐个 restore」的方式，不依赖 prefix 回退。
+# =========================================================
+
 on:
   schedule:
-    - cron: '0 0 */5 * *'
+    # 每 3 天一次。staging 只被 warm-cache.yml 每周一访问一次，
+    # 正好擦 7 天的边；schedule 稍有延迟就会超期，所以这里更频繁些。
+    - cron: '0 0 */3 * *'
   workflow_dispatch:
+    inputs:
+      verbose:
+        description: '打印全部缓存条目（含大小、上次访问时间）'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+permissions:
+  actions: read
+  contents: read
 
 jobs:
-  keepalive:
+  # =========================================================
+  # 第一步：把当前存在的缓存 key 全部枚举出来
+  #
+  #   为什么不能直接用 restore-keys 前缀回退：
+  #     实测日志是 "Cache not found for input keys:
+  #     keepalive-toolchain-never-match, ponwrt-toolchain-"，
+  #     而 Caches 页面里确实存在 ponwrt-toolchain-airoha-an7581-743a557e3e0b5679。
+  #     即 —— 带 lookup-only 的 restore 走前缀没能解析到已有条目。
+  #     与其继续猜语义，不如先把精确 key 列出来再逐个命中，
+  #     这是唯一能确定「真的访问到了」的做法。
+  #
+  #   ⚠ gh 必须带 -R：本 job 没有 checkout，cwd 不是 git 仓库，
+  #     gh 无法推断仓库，会报
+  #     "failed to run git: fatal: not a git repository"。
+  # =========================================================
+  enum:
     runs-on: ubuntu-latest
+    outputs:
+      keys: ${{ steps.list.outputs.keys }}
+      count: ${{ steps.list.outputs.count }}
     steps:
-      - name: Touch toolchain caches
-        uses: actions/cache/restore@v5
-        with:
-          path: /tmp/dummy
-          key: ponwrt-toolchain-
-          lookup-only: true   # 只检查不下载，几秒完成
+      - name: List cache keys
+        id: list
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # ⚠ path 目录必须存在：actions/cache 会对 path 做解析，
+          #   指向不存在的目录时行为不确定
+          mkdir -p /tmp/dummy
 
-      - name: Touch dl caches
+          gh cache list -R "$GITHUB_REPOSITORY" --limit 200 --json key \
+            --jq '.[].key' > all.txt
+
+          # 只保留本项目用到的前缀
+          grep -E '^ponwrt-(staging|toolchain|dl|ccache)-' all.txt > keys.txt || true
+
+          COUNT=$(wc -l < keys.txt || echo 0)
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::warning::没有查到任何 ponwrt-* 缓存 —— 检查 GITHUB_TOKEN 权限或缓存是否已建"
+            echo "keys=[]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          {
+            echo "===== 待保活的缓存条目 ($COUNT) ====="
+            cat keys.txt
+          }
+
+          # 转成 JSON 数组供 matrix 使用
+          jq -R -s 'split("\n") | map(select(length > 0))' keys.txt > keys.json
+          echo "keys=$(cat keys.json | tr -d '\n')" >> "$GITHUB_OUTPUT"
+
+  # =========================================================
+  # 第二步：每个 key 一次精确 restore（★ 不再用 lookup-only）
+  #
+  #   实测现象：key 与 Caches 页面完全一致（连字符尾号都对得上），
+  #   精确匹配 + lookup-only: true 仍然报
+  #     Cache not found for input keys: ponwrt-toolchain-airoha-an7581-743a557e3e0b5679
+  #
+  #   结论：lookup-only 走的是「只查不下载」的另一条代码路径，
+  #   它既不可靠地命中，也不确定会不会刷新 lastAccessedAt ——
+  #   两个目的都没达成。前缀回退之前也被证明不生效。
+  #
+  #   所以这里改成【真实 restore】：把缓存下下来解压到临时目录。
+  #   这肯定算一次访问，命中与否也看得见。
+  #
+  #   代价：每次保活要下载约 1.8 GB（三条加起来）。
+  #   但走的是 GitHub 内网，实测几十秒，且不占 actions 分钟数之外
+  #   的任何配额。相比「缓存被淘汰后重编 1~1.5 小时」，很划算。
+  # =========================================================
+  touch:
+    needs: enum
+    if: needs.enum.outputs.count != '0'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        key: ${{ fromJson(needs.enum.outputs.keys) }}
+      fail-fast: false
+      max-parallel: 10
+    steps:
+      - name: Touch ${{ matrix.key }}
+        id: t
         uses: actions/cache/restore@v5
         continue-on-error: true
         with:
-          path: /tmp/dummy
-          key: ponwrt-dl-master-
-          lookup-only: true
+          # 真实下载；内容丢进临时目录，job 结束即弃
+          path: /tmp/keepalive
+          key: ${{ matrix.key }}
+
+      - name: Result ${{ matrix.key }}
+        if: always()
+        run: |
+          HIT='${{ steps.t.outputs.cache-hit }}'
+          case "$HIT" in
+            true) echo "✅ 命中并已刷新访问时间" ;;
+            *)    echo "::warning::未命中 —— 检查该 key 是否属于当前分支" ;;
+          esac
+          du -sh /tmp/keepalive 2>/dev/null || true
+
+  # =========================================================
+  # 第三步：验证
+  #
+  #   跑完后去 Actions → Caches 看 "Last used" 是否刷新到刚才。
+  #
+  #   如果仍然 "Cache not found"，那多半不是 key 写错，而是
+  #   【缓存作用域】问题：
+  #     actions/cache 只能读到「当前分支 / 上游分支 / 默认分支」建的缓存。
+  #     gh cache list 走的是 REST API，能看到全仓库所有分支的缓存。
+  #   所以列表里看得见、restore 时找不到，是正常的 ——
+  #   请把本 workflow 放到与建缓存相同的分支上跑（通常是默认分支）。
+  # =========================================================
+  verify:
+    needs: [enum, touch]
+    if: always() && github.event.inputs.verbose != 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Show all caches with last-used time
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "===== 全部缓存（key / 大小 / 上次访问）====="
+          gh cache list -R "$GITHUB_REPOSITORY" --limit 200 \
+            --json key,sizeInBytes,lastAccessedAt \
+            --jq '.[] | "\(.lastAccessedAt)\t\(.sizeInBytes/1048576|floor)MB\t\(.key)"' \
+            | sort -r
+          echo ""
+          echo "对照上面的时间：本流程刚跑过，ponwrt-* 条目的"
+          echo "Last used 应当已刷新到当前时间。"
