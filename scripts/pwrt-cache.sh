@@ -67,24 +67,40 @@ staging_parts() {
 # ---------------------------------------------------------------
 fingerprint() {
   local tmp; tmp=$(mktemp)
+  local parts; parts=$(mktemp)
 
   # ⚠ 口径只覆盖「会影响 host 工具链 / 交叉编译器 / host 侧 Go·Rust」的东西。
   #   刻意【不】含整机 .config 与上游 HEAD —— 见下方说明。
 
+  # seg：算一段的子哈希，写进 tmp 的同时打印出来。
+  #   ★ 为什么要分段打印：生产端(warm-cache)与消费端(主流程)算出的 FP
+  #     一旦不同，光看那个 32 位总哈希完全无法定位是哪一项变了。
+  #     分段打印后两边逐行对一下，一眼就能看出差异来源。
+  seg() { # $1=名称，$2..=待哈希的文件
+    local name="$1"; shift
+    local h
+    h=$(for f in "$@"; do [ -e "$f" ] && md5sum "$f"; done 2>/dev/null \
+        | sort -k2 | md5sum | cut -d' ' -f1)
+    # ⚠ 只写 $parts，不写 stdout —— stdout 是要被解析成 KEY 的，
+    #   混进分段表会把 FP 变成一长串（之前用 tee 就踩了这个）
+    printf '  %-14s %s\n' "$name" "${h:-none}" >> "$parts"
+    printf '%s %s\n' "$name" "${h:-none}" >> "$tmp"
+  }
+
   # 1) 构建系统本身
   #    include/ 变动会改变编译行为；tools/ toolchain/ 决定工具链版本。
-  #   这两项与「上游新增了什么软件包」无关，所以上游提交不会让缓存失效。
+  #    这两项与「上游新增了什么软件包」无关，所以上游提交不会让缓存失效。
+  #    ⚠ 拆成三段而不是合并：include/ 变动远比 tools/ toolchain/ 频繁，
+  #      合并的话看不出到底是哪一个变了。
   for d in include tools toolchain; do
-    find "$d" -type f \( -name 'Makefile' -o -name '*.mk' -o -name '*.sh' \) \
-      -exec md5sum {} + 2>/dev/null | sort -k2 >> "$tmp"
+    seg "$d" $(find "$d" -type f \
+      \( -name 'Makefile' -o -name '*.mk' -o -name '*.sh' \) 2>/dev/null)
   done
 
   # 2) host 侧语言栈的包定义 —— 决定 golang / rustc 的版本与构建方式
-  for d in feeds/packages/lang/golang feeds/packages/lang/rust \
-           package/feeds/packages/golang package/feeds/packages/rust; do
-    [ -e "$d" ] || continue
-    find -L "$d" -maxdepth 2 -type f \
-      \( -name 'Makefile' -o -name '*.mk' \) -exec md5sum {} + 2>/dev/null | sort -k2 >> "$tmp"
+  for d in feeds/packages/lang/golang feeds/packages/lang/rust; do
+    seg "$(basename "$d")" $([ -e "$d" ] && find -L "$d" -maxdepth 2 -type f \
+      \( -name 'Makefile' -o -name '*.mk' \) 2>/dev/null)
   done
 
   # 3) feeds 配置（仅配置文件，★ 不含各 feed 的 HEAD）
@@ -97,7 +113,7 @@ fingerprint() {
   #      而 golang / rust 的包定义已经在第 2 步按内容哈希过了，
   #      再按 feed 提交号算一遍纯属重复且有害。
   for f in feeds.conf feeds.conf.default; do
-    [ -f "$f" ] && md5sum "$f" >> "$tmp"
+    [ -f "$f" ] && { seg "$f" "$f"; }
   done
 
   # 4) CI 侧会改变源码树的脚本
@@ -111,7 +127,7 @@ fingerprint() {
   local ci="${GITHUB_WORKSPACE:-}"
   if [ -n "$ci" ] && [ -d "$ci" ]; then
     for f in diy-part1.sh diy-part2.sh; do
-      [ -f "$ci/$f" ] && md5sum "$ci/$f" >> "$tmp"
+      [ -f "$ci/$f" ] && seg "$f" "$ci/$f"
     done
   fi
 
@@ -120,6 +136,10 @@ fingerprint() {
 
   local fp; fp=$(md5sum "$tmp" | cut -d' ' -f1)
   rm -f "$tmp"
+  # 分段表打到 stderr：既不污染 stdout 的 KEY 解析，
+  # 又能在 Actions 日志里看到，方便两边对比
+  [ -s "$parts" ] && { echo "----- 指纹分项（用于定位两端差异）-----" >&2; cat "$parts" >&2; }
+  rm -f "$parts"
   printf '%s' "$fp"
 }
 
