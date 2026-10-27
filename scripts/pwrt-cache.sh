@@ -87,17 +87,18 @@ fingerprint() {
       \( -name 'Makefile' -o -name '*.mk' \) -exec md5sum {} + 2>/dev/null | sort -k2 >> "$tmp"
   done
 
-  # 3) feeds 配置与各 feed 的提交
+  # 3) feeds 配置（仅配置文件，★ 不含各 feed 的 HEAD）
+  #
+  #    ⚠ 这里原来算了 feeds/*/ 的 git rev-parse HEAD，那是致命的：
+  #      feed 是独立的 git 仓库，每次 ./scripts/feeds update -a 都会
+  #      拉到新的提交。warm-cache 周一跑、主流程周四跑，两者 HEAD
+  #      几乎必然不同 → 指纹不同 → staging 永远命中不了。
+  #
+  #      而 golang / rust 的包定义已经在第 2 步按内容哈希过了，
+  #      再按 feed 提交号算一遍纯属重复且有害。
   for f in feeds.conf feeds.conf.default; do
     [ -f "$f" ] && md5sum "$f" >> "$tmp"
   done
-  if [ -d feeds ]; then
-    for d in feeds/*/; do
-      [ -d "$d" ] || continue
-      printf '%s ' "${d%/}" >> "$tmp"
-      git -C "$d" rev-parse HEAD 2>/dev/null >> "$tmp" || echo "-" >> "$tmp"
-    done
-  fi
 
   # 4) CI 侧会改变源码树的脚本
   #    ⚠ 刻意【不】算 configs/*.config：
@@ -105,13 +106,13 @@ fingerprint() {
   #      两者内容必然不同。算进去的话两边 key 永远对不上，
   #      主流程就永远命中不了 warm-cache 生成的缓存。
   #      而机型选择只影响 target 侧包，不影响 host 工具链，本就不该进指纹。
+  #    ⚠ 同理【不】算 .github/workflows/*.yml：
+  #      改一次 workflow 就让缓存全部作废，且它与工具链内容无关。
   local ci="${GITHUB_WORKSPACE:-}"
   if [ -n "$ci" ] && [ -d "$ci" ]; then
     for f in diy-part1.sh diy-part2.sh; do
       [ -f "$ci/$f" ] && md5sum "$ci/$f" >> "$tmp"
     done
-    find "$ci/.github/workflows" -maxdepth 1 -type f -name '*.yml' \
-      -exec md5sum {} + 2>/dev/null | sort -k2 >> "$tmp"
   fi
 
   # 5) runner 架构
