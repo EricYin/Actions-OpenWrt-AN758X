@@ -95,7 +95,7 @@ jobs:
         if: ${{ steps.probe.outputs.need_token == 'true' && env.HAS_APP_CREDS == 'true' }}
         # 拿不到令牌不炸 job：交给 Setup 步骤回退 PAT
         continue-on-error: true
-        uses: actions/create-github-app-token@v1
+        uses: actions/create-github-app-token@v3
         with:
           client-id: ${{ vars.PRIVATE_SOURCE_APP_CLIENT_ID }}
           private-key: ${{ secrets.PRIVATE_SOURCE_APP_PRIVATE_KEY }}
