@@ -532,18 +532,51 @@ pack)
   #    下次 make 仍然判定要重编 → rustc 从零自举（30~60 分钟），
   #    缓存等于只省了个下载。这就是「缓存命中了还是很慢」的根因。
   #
-  #    stamp 是空文件，几十字节，代价可以忽略；
-  #    真正大的构建树仍然不收（见 HOST_INCLUDE_BUILDDIR）。
+  #    stamp 是空文件，几十字节，代价可以忽略。
   # ---------------------------------------------------------------
   find build_dir -type f \
        \( -name '.built' -o -name '.prepared*' -o -name '.configured*' \) \
        2>/dev/null >> "$LIST"
 
-  # 5) 可选：整个构建树（默认关，rust 的构建树 5~10GB，塞不进缓存配额）
-  if [ "$HOST_INCLUDE_BUILDDIR" = "true" ]; then
-    find build_dir/host build_dir/hostpkg -maxdepth 1 \
-         \( -name 'golang*' -o -name 'go-*' -o -name 'go-bootstrap*' -o -name 'rust*' \) 2>/dev/null >> "$LIST"
-  fi
+  # ---------------------------------------------------------------
+  # 5) 构建树（默认收，HOST_INCLUDE_BUILDDIR 控制）
+  #
+  #    ⚠ 之前这里只找了 build_dir/host 和 build_dir/hostpkg，
+  #      **漏了 build_dir/target-*/host** —— rust 的构建树正在那里：
+  #        build_dir/target-aarch64_cortex-a53_musl/host/rustc-1.96.0-src/
+  #      结果 HOST_INCLUDE_BUILDDIR=true 时 golang 树收了、rust 树没收到。
+  #      现在三个位置都找。
+  #
+  #    分档：
+  #      true / all  —— 全收（默认）
+  #      slim        —— 收 golang 全树；rust 只收 src/，跳过 build/ 中间产物
+  #      stamps      —— 只收 stamp（等同 4)，构建树不收）
+  #      false / none—— 同上
+  #
+  #    slim 存在的理由：rust 的 build/ 是绝对大头（stage 中间产物，
+  #    实测整体 5~10GB）。只收 src/ 能砍掉大半体积，
+  #    而 src/ 之外的内容对「make 不重编 + rustc 可用」并非必需。
+  # ---------------------------------------------------------------
+  build_dir_trees() { # 输出待收的构建树目录
+    local base
+    for base in build_dir/host build_dir/hostpkg build_dir/target-*/host; do
+      [ -d "$base" ] || continue
+      case "${HOST_INCLUDE_BUILDDIR:-true}" in
+        true|all)
+          find "$base" -maxdepth 1 \
+            \( -name 'golang*' -o -name 'go-*' -o -name 'go-bootstrap*' -o -name 'rust*' \) 2>/dev/null
+          ;;
+        slim)
+          find "$base" -maxdepth 1 \
+            \( -name 'golang*' -o -name 'go-*' -o -name 'go-bootstrap*' \) 2>/dev/null
+          # rust 只收 src 子目录，跳过 build/（中间产物，最大头）
+          find "$base" -maxdepth 2 -type d -path '*/rust*/src' 2>/dev/null
+          ;;
+        *) : ;;  # stamps / false / none：不收
+      esac
+    done
+  }
+  build_dir_trees >> "$LIST"
 
   # 去重（多套目录可能同时命中同一文件）
   sort -u "$LIST" -o "$LIST"
@@ -570,10 +603,35 @@ pack)
     done
   fi
 
+  # ---------------------------------------------------------------
+  # 打包前先估体积。
+  #
+  #   收了构建树之后缓存可能很大（rust 的 build/ 是 5~10GB 量级），
+  #   两个硬限制必须提前知道：
+  #     - GitHub Release 单个资产上限 2GB  → 超了上传必失败
+  #     - actions/cache 仓库总配额 10GB    → 一份占满会挤掉工具链和 dl 缓存
+  #   所以这里只告警、不阻断：让用户在日志里直接看到数字，自行决定是否
+  #   把 HOST_INCLUDE_BUILDDIR 调成 slim / stamps。
+  # ---------------------------------------------------------------
+  if command -v du >/dev/null 2>&1; then
+    RAW_KB=$(du -sk $(cat "$LIST") 2>/dev/null | awk '{s+=$1} END{print s+0}')
+    RAW_MB=$(( RAW_KB / 1024 ))
+    echo "原始体积约: ${RAW_MB} MB（压缩后通常为其 1/4~1/3）"
+    if [ "$RAW_MB" -gt 20480 ]; then
+      echo "::warning::原始体积 ${RAW_MB} MB 偏大 —— 压缩后仍可能超过 Release 的 2GB 上限"
+      echo "::warning::建议把 HOST_INCLUDE_BUILDDIR 设为 slim（rust 只收 src/）或 stamps（不收树）"
+    fi
+  fi
+
   TARBALL="$HOST_CACHE_DIR/${KEY}.tzst"
   rm -f "$TARBALL"
   if tar -I zstdmt -cf "$TARBALL" -T "$LIST"; then
     ls -lh "$TARBALL"
+    # 打完再看一次真实大小：这才是 Release / cache 的实际负担
+    SZ=$(stat -c%s "$TARBALL" 2>/dev/null || echo 0)
+    if [ "$SZ" -gt 2147483648 ]; then
+      echo "::warning::$TARBALL 超过 2GB，Release 上传会被拒绝；actions/cache 也会吃掉大量配额"
+    fi
     echo "packed=true" >> "${GITHUB_OUTPUT:-/dev/null}"
   else
     echo "::warning::打包失败，本次不缓存 host 工具链"
