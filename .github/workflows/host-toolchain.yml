@@ -66,6 +66,16 @@ on:
         options:
           - 'true'
           - 'false'
+      stacks:
+        description: '编哪些 host 语言栈（auto = 按当前配置判断；本仓无 Go 包，默认只编 rust）'
+        required: false
+        default: 'rust'
+        type: choice
+        options:
+          - rust
+          - both
+          - golang
+          - auto
       reuse_toolchain:
         description: '复用主流程的工具链缓存（关 = 现场 make tools/toolchain install）'
         required: false
@@ -95,13 +105,15 @@ env:
   HOST_CACHE_DIR: /workdir/hosttool-cache
   HOST_INCLUDE_BUILDDIR: 'false'
   HOST_RELEASE_BACKUP: ${{ github.event.inputs.upload_release == 'false' && 'false' || 'true' }}
-  # ★ 固定 both：本流程产出的缓存必须同时含 golang 与 rust，不看机型配置。
+  # ★ 独立流程不能只用 auto：它用的是 configs/<soc>.config 这种 subtarget
+  #   基础配置，里面一个 Go/Rust 包都没有，按需判断会得出「什么都不用编」。
+  #   而真正需要 Rust 的是机型配置（h3c_hm2004-du 的 h3c-fttr-tools）。
   #
-  #   理由：它用的是 configs/<soc>.config 这种 subtarget 基础配置，
-  #   里面一个 Go/Rust 包都没有（按需判断会得出「什么都不用编」），
-  #   而真正需要它们的是机型配置（如 h3c_hm2004-du 的 h3c-fttr-tools）。
-  #   缓存是 subtarget 级共享的，一份编全，该 subtarget 下所有机型都能用。
-  FORCE_ALL_STACKS: 'both'
+  #   默认 rust 而不是 both：实测全仓 14 个 configs 里 Go 包数量为 0
+  #   （tailscale / openlist / mosdns / easytier 全部默认 false），
+  #   编 golang 要走 go1.4→1.17→1.20→1.22→1.24 五段自举（40~70 分钟），
+  #   编出来没人用。需要时把 stacks 输入改成 both。
+  FORCE_ALL_STACKS: ${{ github.event.inputs.stacks || 'rust' }}
   # 用 '== true' 而不是 '|| 默认值'：GitHub 表达式里非空字符串即真，
   # 'false' 不会被判为假；schedule 触发时 inputs 为 null 也要有确定值。
   FORCE_REBUILD: ${{ github.event.inputs.force == 'true' && 'true' || 'false' }}
