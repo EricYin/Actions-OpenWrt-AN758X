@@ -507,6 +507,10 @@ jobs:
       - name: Build host Go / Rust toolchain
         id: host-build
         run: |
+          # 这一段会逐包打印 go install -v 的包名（几千行），默认折叠；
+          # step 失败时 Actions 会自动展开，不用额外处理。
+          trap 'echo "::endgroup::"' EXIT
+          echo "::group::host 工具链编译（日志已折叠，点开可看全量）"
           cd "$BUILD_ROOT/openwrt"
           JOBS=$(awk -v p="$(nproc)" '/^MemAvailable:/{m=int($2/2097152)+1} END{print m<p?m:p}' /proc/meminfo)
           JOBS=$(( JOBS < 1 ? 1 : JOBS ))
@@ -515,6 +519,8 @@ jobs:
           FORCE_ALL_STACKS="$FORCE_ALL_STACKS" \
           JOBS="$JOBS" \
             bash "$GITHUB_WORKSPACE/scripts/host-toolchain.sh" build "$BUILD_ROOT/openwrt"
+          echo "::endgroup::"
+          trap - EXIT
 
       - name: Pack host toolchain
         id: host-pack
