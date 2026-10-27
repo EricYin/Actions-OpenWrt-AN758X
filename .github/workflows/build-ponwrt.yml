@@ -358,35 +358,7 @@ jobs:
 
           cd openwrt && echo "commit: $(git rev-parse --short HEAD)"
 
-      # =========================================================
-      # 2.5 私有仓库凭证（openwrt-fttr feed 的来源）
-      #
-      # 凭证优先级：GitHub App 安装令牌 > Secret 里的 PAT
-      #   App 令牌：1 小时有效、仅限白名单仓库、contents 只读、job 结束自动吊销，
-      #             泄露窗口和权限面都比长期 PAT 小一个量级。
-      #
-      # 注入方式：GIT_ASKPASS（而不是 git insteadOf）
-      #   令牌写进 $RUNNER_TEMP/gh_token（600），git 被要求认证时才由 askpass
-      #   读出来。好处：令牌不进命令行、不写进 ~/.gitconfig、不出现在后续
-      #   步骤的 env 里；diy-part1.sh 的 clone URL 保持裸 URL，一行都不用改。
-      #   ⚠ 别再拼 user:token@ 或写 url.*.insteadOf —— 那会落盘到 git config，
-      #     还会和 checkout 注入的 extraheader 抢优先级（后者写本地 .git/config，
-      #     本地优先级更高，会直接盖掉令牌 → 404 Repository not found）。
-      #
-      # PAT 回退：secrets.PRIVATE_REPO_TOKEN > secrets.FTTR_TOKEN（旧名兼容）
-      # ⚠ workflow_dispatch 的输入值会明文出现在 run 页面、也能被 API 读到，
-      #   所以不设令牌输入框，长期凭证只放 Secret。
-      # =========================================================
-
-      # ---------------------------------------------------------
-      # 先探测、后取凭证：公开仓库零凭证直接 clone，只有私有仓库才去申请
-      # GitHub App 令牌。好处有三：
-      #   1) 仓库哪天转公开，不用改任何配置自动生效；
-      #   2) 没装 App 的 fork 在「后端仓库是公开」的情况下照样能跑；
-      #   3) 令牌只在真正需要时才存在，暴露面最小。
-      # 探测必须真匿名：此时 GIT_ASKPASS 尚未设置，且 checkout 已用
-      # persist-credentials: false，git 里没有本仓库的 GITHUB_TOKEN 头。
-      # ---------------------------------------------------------
+      
       - name: Probe FTTR repos visibility
         id: probe
         if: ${{ env.PRIVATE_REPO != 'none' && (env.PROFILE == 'h3c_hm2004-du' || github.event.inputs.profile == 'h3c_hm2004-du') }}
