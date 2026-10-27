@@ -58,6 +58,15 @@ on:
         options:
           - 'false'
           - 'true'
+      include_builddir:
+        description: '打包时连 build_dir 构建树一起收（all=全收 slim=rust只收src stamps=只收stamp）'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'slim'
+          - 'stamps'
       upload_release:
         description: '额外存一份到 Release（actions/cache 7 天未命中会淘汰，Release 不会）'
         required: false
@@ -93,7 +102,9 @@ env:
 
   # ⚠ actions/cache 的 with.path 不接受 GITHUB_ENV 动态值，必须是 workflow 级静态
   HOST_CACHE_DIR: /workdir/hosttool-cache
-  HOST_INCLUDE_BUILDDIR: 'false'
+  # 是否把 build_dir 的构建树一起打包（默认收）
+  #   all/true = 全收 | slim = rust 只收 src/ | stamps = 只收 stamp 不收树
+  HOST_INCLUDE_BUILDDIR: ${{ github.event.inputs.include_builddir || 'true' }}
   HOST_RELEASE_BACKUP: ${{ github.event.inputs.upload_release == 'false' && 'false' || 'true' }}
   # ★ 固定 both：本流程产出的缓存必须同时含 golang 与 rust，不看机型配置。
   #
