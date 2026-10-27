@@ -67,6 +67,10 @@ permissions:
 
 env:
   BUILD_ROOT: /workdir
+  # ⚠ SOURCE 必须定义：dl / ccache 的 key 用到它。
+  #   漏了的话 key 会变成 ponwrt-dl--master-202644（两个连字符），
+  #   与主流程的 ponwrt-dl-pbs05/ponwrt-master-... 对不上，等于每次冷下。
+  SOURCE: ${{ github.event.inputs.source || 'pbs05/ponwrt' }}
   REPO_URL: ${{ github.event.inputs.source == 'fork' && 'https://github.com/qwe3017/ponwrt' || 'https://github.com/pbs05/ponwrt' }}
   REPO_BRANCH: ${{ github.event.inputs.branch || 'master' }}
   FEEDS_CONF: ''
@@ -245,6 +249,26 @@ jobs:
           bash "$SCRIPT" fingerprint "$BUILD_ROOT/openwrt"
 
       # =========================================================
+      # toolchain 缓存 key —— 与主流程 Generate toolchain cache key
+      # 【完全同口径】，这样两边才能命中同一条目。
+      #
+      #   注意口径比 staging 指纹窄得多：只算 tools/ toolchain/ 下的
+      #   Makefile 与 *.mk。上游新增软件包不会让它失效，所以这份缓存
+      #   比 staging 稳定得多，是 staging 未命中时的重要回退。
+      # =========================================================
+      - name: Generate toolchain cache key
+        id: tc-key
+        run: |
+          cd "$BUILD_ROOT/openwrt"
+          TARGET=$(grep '^CONFIG_TARGET_BOARD=' .config | cut -d'"' -f2)
+          SUBTARGET=$(grep '^CONFIG_TARGET_SUBTARGET=' .config | cut -d'"' -f2)
+          TOOLS_HASH=$(find tools toolchain -type f \( -name "Makefile" -o -name "*.mk" \) \
+            -exec md5sum {} + 2>/dev/null | sort | md5sum | cut -d' ' -f1)
+          CACHE_KEY="ponwrt-toolchain-${TARGET}-${SUBTARGET}-${TOOLS_HASH:0:16}"
+          echo "CACHE_KEY=$CACHE_KEY" >> "$GITHUB_OUTPUT"
+          echo "toolchain 缓存 Key: $CACHE_KEY"
+
+      # =========================================================
       # 恢复（双通道）：actions/cache → Release → 解压+touch
       # =========================================================
       - name: Restore staging from actions/cache
@@ -289,13 +313,93 @@ jobs:
             bash "$GITHUB_WORKSPACE/scripts/pwrt-cache.sh" unpack "$BUILD_ROOT/openwrt"
 
       # =========================================================
+      # ★ staging 未命中 → 退而复用主流程的 toolchain 缓存
+      #
+      #   这份缓存由主流程 scope=toolchain-only（或任意一次跑完
+      #   Handle toolchain 的运行）生成，含 host 工具 + 交叉编译器，
+      #   能省掉 1~1.5 小时的 tools/toolchain 编译。
+      #   它不含 golang / rustc（那是 staging 多出来的部分），
+      #   所以命中后 Build host golang / rust 仍需照跑。
+      #
+      #   ⚠ path 必须与主流程【完全一致】：主流程存的是
+      #     staging_dir/host* 和 staging_dir/tool* 这两个通配目录
+      #     （不是打包的 tzst）。写成精确路径会对不上。
+      #
+      #   只在 staging 未命中时才试，命中就别浪费时间下载了。
+      # =========================================================
+      - name: Restore toolchain from actions/cache
+        id: tc-restore
+        if: >-
+          env.FORCE_REBUILD != 'true'
+          && steps.staging-unpack.outputs.unpacked != 'true'
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        with:
+          path: |
+            ${{ env.BUILD_ROOT }}/openwrt/staging_dir/host*
+            ${{ env.BUILD_ROOT }}/openwrt/staging_dir/tool*
+          key: ${{ steps.tc-key.outputs.CACHE_KEY }}
+
+      - name: Restore toolchain from Release backup
+        id: tc-release-restore
+        if: >-
+          env.FORCE_REBUILD != 'true'
+          && steps.staging-unpack.outputs.unpacked != 'true'
+          && steps.tc-restore.outputs.cache-hit != 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd "$BUILD_ROOT/openwrt"
+          CACHE_KEY="${{ steps.tc-key.outputs.CACHE_KEY }}"
+          ASSET_NAME="${CACHE_KEY}.tzst"
+
+          if ! gh release view toolchain-cache --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "restored=false" >> "$GITHUB_OUTPUT"
+            echo "toolchain-cache Release 不存在"
+            exit 0
+          fi
+
+          # tzst 需要 unzstd；runner 未预装时先装，避免「假命中」后解压失败
+          which unzstd >/dev/null 2>&1 || sudo -E apt-get -yqq install zstd >/dev/null 2>&1 || true
+
+          if gh release view toolchain-cache --repo "$GITHUB_REPOSITORY" \
+               --json assets -q '.assets[].name' 2>/dev/null | grep -qx "$ASSET_NAME"; then
+            echo "从 Release 下载工具链: $ASSET_NAME"
+            gh release download toolchain-cache --repo "$GITHUB_REPOSITORY" -p "$ASSET_NAME" -D .
+            tar -I unzstd -xf "$ASSET_NAME" || tar -xf "$ASSET_NAME"
+            rm -f "$ASSET_NAME"
+            echo "restored=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "restored=false" >> "$GITHUB_OUTPUT"
+            echo "Release 中无匹配的 toolchain 缓存"
+          fi
+
+      # =========================================================
+      # touch：两条通道恢复出来的内容都要刷新 stamp，
+      # 否则 make 认为「源码比产物新」而全部重编。
+      # =========================================================
+      - name: Touch toolchain stamps
+        if: >-
+          steps.tc-restore.outputs.cache-hit == 'true'
+          || steps.tc-release-restore.outputs.restored == 'true'
+        run: |
+          cd "$BUILD_ROOT/openwrt"
+          find staging_dir -path '*/stamp/*' -type f -exec touch {} + 2>/dev/null || true
+          find staging_dir/host/bin staging_dir/toolchain*/bin -type f -exec touch {} + 2>/dev/null || true
+          touch tools/stamp-compile toolchain/stamp-compile 2>/dev/null || true
+
+      # =========================================================
       # 编译：命中就整段跳过
       #   tools/install  → host 工具（含 gcc）
       #   toolchain/install → 交叉编译器（rust 需要它）
       #   golang / rust 的 host 包
       # =========================================================
       - name: Build tools and toolchain
-        if: steps.staging-unpack.outputs.unpacked != 'true'
+        if: >-
+          steps.staging-unpack.outputs.unpacked != 'true'
+          && steps.tc-restore.outputs.cache-hit != 'true'
+          && steps.tc-release-restore.outputs.restored != 'true'
         run: |
           cd "$BUILD_ROOT/openwrt"
           make tools/download -j"$(nproc)" || echo "::warning::tools/download 有告警"
@@ -314,13 +418,29 @@ jobs:
           # ★ 一律编全，不看机型配置：缓存是 subtarget 级共享的，
           #   一次编好给该 subtarget 下所有机型用。
           for p in golang-bootstrap golang rust; do
-            rel=$(find package -maxdepth 4 -type d -name "$p" 2>/dev/null | head -1)
-            [ -z "$rel" ] && { echo "树里没有 $p，跳过"; continue; }
+            # ⚠ -L 必须有。package/feeds/packages/* 是指向 feeds/packages/lang/*
+            #   的符号链接，find 默认(-P)不跟随，且 -type d 不匹配符号链接本身，
+            #   结果连 package/feeds/packages/golang 都找不到 —— 三个包全被跳过。
+            rel=$(find -L package -maxdepth 4 -type d -name "$p" 2>/dev/null | head -1)
+            [ -z "$rel" ] && { echo "::warning::树里没有 $p，跳过"; continue; }
             echo "===== make $rel/host/compile ====="
             make "$rel/download" >/dev/null 2>&1 || true
             # 不加 V=s：golang bootstrap 有 9000+ 个包，会刷上万行日志
             make "$rel/host/compile" -j"$JOBS" || make "$rel/host/compile" -j1 V=s || \
               echo "::warning::$p host 编译失败（其余继续）"
+
+            # 落地校验：make 返回 0 不等于真编出了东西。
+            #   包已 installed、没有 HostBuild、target 名对不上，make 都会安静返回 0。
+            #   不校验的话缓存里可能根本没有 go / rustc，而日志一片"成功"。
+            case "$p" in
+              rust) BIN=rustc ;;
+              *)    BIN=go   ;;
+            esac
+            if ! find staging_dir -path "*/bin/$BIN" -type f 2>/dev/null | grep -q .; then
+              echo "::warning::$p: make 返回 0，但 staging_dir 里没有 $BIN"
+            else
+              echo "✅ $p 产物已就位"
+            fi
           done
           touch tools/stamp-compile toolchain/stamp-compile 2>/dev/null || true
 
@@ -382,7 +502,7 @@ jobs:
         continue-on-error: true
         run: |
           cd "$BUILD_ROOT/openwrt"
-          REPORT_DIR="$GITHUB_WORKSPACE/build-reports" mkdir -p "$GITHUB_WORKSPACE/build-reports"
+          mkdir -p "$GITHUB_WORKSPACE/build-reports"
           REPORT_DIR="$GITHUB_WORKSPACE/build-reports" \
             bash "$GITHUB_WORKSPACE/scripts/pwrt-cache.sh" status "$BUILD_ROOT/openwrt"
 

@@ -1,27 +1,97 @@
-name: Keep Toolchain Cache Alive
+name: Keep Build Caches Alive
 
-# actions/cache 的条目 7 天不访问会被回收，
-# 每 5 天 touch 一次工具链缓存，保证常用机型不用每次重编工具链。
+# =========================================================
+# actions/cache 的条目 7 天不访问会被回收。
+# 本流程定期 touch 一次各类缓存，保证常用机型不用每次重编。
+#
+# ⚠ 原文件的写法有个问题（见下），这里一并修了。
+# =========================================================
+
 on:
   schedule:
-    - cron: '0 0 */5 * *'
+    # 每 3 天一次。staging 缓存只被 warm-cache.yml 每周一访问一次，
+    # 正好擦 7 天的边——schedule 稍有延迟就会超期，所以这里更频繁些。
+    - cron: '0 0 */3 * *'
   workflow_dispatch:
+    inputs:
+      verbose:
+        description: '打印查到的缓存条目'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+permissions:
+  actions: read
 
 jobs:
   keepalive:
     runs-on: ubuntu-latest
     steps:
-      - name: Touch toolchain caches
+      # ---------------------------------------------------------
+      # ⚠ 关键：actions/cache/restore 的 key 是【精确匹配】，
+      #   restore-keys 才是前缀回退。
+      #
+      #   原文件写的是 key: ponwrt-toolchain-（一个带尾连字符、
+      #   实际并不存在的 key），于是每次都 miss —— 等于这个保活
+      #   流程一直没生效，只是静默地什么也没做。
+      #
+      #   正确写法：key 给一个必然不命中的占位值 + restore-keys 前缀。
+      # ---------------------------------------------------------
+      - name: Touch staging caches
         uses: actions/cache/restore@v5
+        continue-on-error: true
         with:
           path: /tmp/dummy
-          key: ponwrt-toolchain-
-          lookup-only: true   # 只检查不下载，几秒完成
+          key: keepalive-staging-never-match
+          restore-keys: |
+            ponwrt-staging-
+          lookup-only: true
 
+      - name: Touch toolchain caches
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        with:
+          path: /tmp/dummy
+          key: keepalive-toolchain-never-match
+          restore-keys: |
+            ponwrt-toolchain-
+          lookup-only: true
+
+      # dl 的 key 含 SOURCE 与分支，前缀要足够短才能覆盖所有组合
       - name: Touch dl caches
         uses: actions/cache/restore@v5
         continue-on-error: true
         with:
           path: /tmp/dummy
-          key: ponwrt-dl-master-
+          key: keepalive-dl-never-match
+          restore-keys: |
+            ponwrt-dl-
           lookup-only: true
+
+      - name: Touch ccache caches
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        with:
+          path: /tmp/dummy
+          key: keepalive-ccache-never-match
+          restore-keys: |
+            ponwrt-ccache-
+          lookup-only: true
+
+      # ---------------------------------------------------------
+      # 验证用：打出当前仓库的缓存条目与「上次访问时间」。
+      #   手动跑时把 verbose 设 true，看 Last used 有没有被刷新。
+      #   如果跑完还是旧时间，说明 lookup-only 不算访问，需要换做法。
+      # ---------------------------------------------------------
+      - name: List caches (verbose)
+        if: github.event.inputs.verbose == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh cache list --limit 100 \
+            --json key,sizeInBytes,lastAccessedAt \
+            --jq '.[] | "\(.key)\t\(.sizeInBytes/1048576|floor)MB\t\(.lastAccessedAt)"' \
+            | sort
