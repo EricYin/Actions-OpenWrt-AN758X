@@ -209,8 +209,12 @@ resolve_stacks() { # 设置 NEED_GO / NEED_RUST
     # 按需判断会得出「什么都不用编」。所以这里支持显式指定。
     # 分档而不是布尔：全仓无 Go 包时，编 golang 是纯浪费 40~70 分钟。
     both|all|true)
+      # 不看 .config，只看包在不在树里。包不在（feed 没装）时明确告警——
+      # 用户要求「缓存必须都有」，静默少一个最难排查。
       NEED_GO="$HAS_GO"; NEED_RUST="$HAS_RUST"
       echo "    FORCE_ALL_STACKS=$force → golang=$NEED_GO rust=$NEED_RUST"
+      [ "$HAS_GO"   = "false" ] && echo "::warning::树里没有 golang 包（feeds 没装？），缓存将缺 golang"
+      [ "$HAS_RUST" = "false" ] && echo "::warning::树里没有 rust 包（feeds 没装？），缓存将缺 rust"
       ;;
     rust|cargo)
       NEED_GO=false; NEED_RUST="$HAS_RUST"
@@ -353,11 +357,17 @@ build)
     # ⚠ 用 package/X/download 而不是 package/X/host/download ——
     #   buildroot 只给包定义了 download，没有 host/download 这一级。
     echo "----- make package/$rel/download -----"
-    make "package/$rel/download" V=s || echo "::warning::$name download 有告警，继续尝试编译"
+    make "package/$rel/download" || echo "::warning::$name download 有告警，继续尝试编译"
 
+    # ⚠ 正常编译【不要】加 V=s：
+    #   V=s 会把每一条编译命令都打进日志。golang bootstrap 有
+    #   9000+ 个包（cmd/vendor/... go/internal/... net/http ...），
+    #   实测刷出上万行，Actions 日志面板卡死、下载日志也极慢。
+    #   只在失败重试时才开，那时需要完整命令定位问题。
     echo "===== make package/$rel/host/compile ($JOBS 线程) ====="
-    if ! make "package/$rel/host/compile" -j"$JOBS" V=s; then
-      echo "::warning::$name 多线程编译失败，单线程重试"
+    echo "（编译输出已静默，长时间无日志属正常；失败时会自动重跑并打开 V=s）"
+    if ! make "package/$rel/host/compile" -j"$JOBS"; then
+      echo "::warning::$name 多线程编译失败，单线程 + V=s 重试（日志会较详细）"
       if ! make "package/$rel/host/compile" -j1 V=s; then
         echo "::warning::$name host 编译失败；不写缓存，后续 make 会再试一次"
         FAIL=1
@@ -546,6 +556,19 @@ pack)
 
   echo "打包 $(wc -l < "$LIST") 个条目："
   sed 's/^/  /' "$LIST"
+
+  # ---------------------------------------------------------------
+  # 完整性校验：缓存必须同时含 golang 与 rust。
+  #   少一个时明确告警 —— 用户要求「不管 config 里有没有，编出的缓存
+  #   必须都有」。静默少一个最难排查：主流程会以为命中了，
+  #   实际却在 Compile the firmware 里现编一遍。
+  # ---------------------------------------------------------------
+  if [ "${REQUIRE_BOTH_STACKS:-true}" = "true" ]; then
+    for want in go rustc; do
+      grep -qE "(^|/)bin/${want}$" "$LIST" || \
+        echo "::warning::打包清单里没有 ${want} —— 缓存不完整，下次该栈会重新编译"
+    done
+  fi
 
   TARBALL="$HOST_CACHE_DIR/${KEY}.tzst"
   rm -f "$TARBALL"
