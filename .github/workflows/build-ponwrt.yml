@@ -295,18 +295,6 @@ jobs:
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          # --- 换掉 Azure 源 + 设置 apt 超时（防慢源假死） ---
-          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|http://archive.ubuntu.com/ubuntu|g' \
-          /etc/apt/sources.list \
-          /etc/apt/sources.list.d/*.list \
-          /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
-            if [ -f /etc/apt/apt-mirrors.txt ]; then
-          sudo sed -i 's|azure.archive.ubuntu.com|archive.ubuntu.com|g' /etc/apt/apt-mirrors.txt 2>/dev/null || true
-            fi
-            echo 'Acquire::Retries "3";
-            Acquire::http::Timeout "30";
-            Acquire::https::Timeout "30";
-            Acquire::Queue-Mode "access";' | sudo tee /etc/apt/apt.conf.d/99github-azure-fix >/dev/null
           # --- 删除预装大件 ---
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
             /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/lib/jvm \

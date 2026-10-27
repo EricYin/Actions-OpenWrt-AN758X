@@ -95,11 +95,13 @@ env:
   HOST_CACHE_DIR: /workdir/hosttool-cache
   HOST_INCLUDE_BUILDDIR: 'false'
   HOST_RELEASE_BACKUP: ${{ github.event.inputs.upload_release == 'false' && 'false' || 'true' }}
-  # ★ 独立流程必须全编：用的是 configs/<soc>.config 这种 subtarget 基础配置，
-  #   里面一个 Go/Rust 包都没有。按需判断会得出「什么都不用编」→ 缓存是空的。
-  #   而真正需要 Rust 的是机型配置（h3c_hm2004-du 的 h3c-fttr-tools）。
-  #   全编一份，该 subtarget 下所有机型都能用。
-  FORCE_ALL_STACKS: 'true'
+  # ★ 固定 both：本流程产出的缓存必须同时含 golang 与 rust，不看机型配置。
+  #
+  #   理由：它用的是 configs/<soc>.config 这种 subtarget 基础配置，
+  #   里面一个 Go/Rust 包都没有（按需判断会得出「什么都不用编」），
+  #   而真正需要它们的是机型配置（如 h3c_hm2004-du 的 h3c-fttr-tools）。
+  #   缓存是 subtarget 级共享的，一份编全，该 subtarget 下所有机型都能用。
+  FORCE_ALL_STACKS: 'both'
   # 用 '== true' 而不是 '|| 默认值'：GitHub 表达式里非空字符串即真，
   # 'false' 不会被判为假；schedule 触发时 inputs 为 null 也要有确定值。
   FORCE_REBUILD: ${{ github.event.inputs.force == 'true' && 'true' || 'false' }}
@@ -507,10 +509,6 @@ jobs:
       - name: Build host Go / Rust toolchain
         id: host-build
         run: |
-          # 这一段会逐包打印 go install -v 的包名（几千行），默认折叠；
-          # step 失败时 Actions 会自动展开，不用额外处理。
-          trap 'echo "::endgroup::"' EXIT
-          echo "::group::host 工具链编译（日志已折叠，点开可看全量）"
           cd "$BUILD_ROOT/openwrt"
           JOBS=$(awk -v p="$(nproc)" '/^MemAvailable:/{m=int($2/2097152)+1} END{print m<p?m:p}' /proc/meminfo)
           JOBS=$(( JOBS < 1 ? 1 : JOBS ))
@@ -519,8 +517,6 @@ jobs:
           FORCE_ALL_STACKS="$FORCE_ALL_STACKS" \
           JOBS="$JOBS" \
             bash "$GITHUB_WORKSPACE/scripts/host-toolchain.sh" build "$BUILD_ROOT/openwrt"
-          echo "::endgroup::"
-          trap - EXIT
 
       - name: Pack host toolchain
         id: host-pack
