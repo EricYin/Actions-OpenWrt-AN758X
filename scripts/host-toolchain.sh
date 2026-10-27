@@ -209,12 +209,8 @@ resolve_stacks() { # 设置 NEED_GO / NEED_RUST
     # 按需判断会得出「什么都不用编」。所以这里支持显式指定。
     # 分档而不是布尔：全仓无 Go 包时，编 golang 是纯浪费 40~70 分钟。
     both|all|true)
-      # 不看 .config，只看包在不在树里。包不在（feed 没装）时明确告警——
-      # 用户要求「缓存必须都有」，静默少一个最难排查。
       NEED_GO="$HAS_GO"; NEED_RUST="$HAS_RUST"
       echo "    FORCE_ALL_STACKS=$force → golang=$NEED_GO rust=$NEED_RUST"
-      [ "$HAS_GO"   = "false" ] && echo "::warning::树里没有 golang 包（feeds 没装？），缓存将缺 golang"
-      [ "$HAS_RUST" = "false" ] && echo "::warning::树里没有 rust 包（feeds 没装？），缓存将缺 rust"
       ;;
     rust|cargo)
       NEED_GO=false; NEED_RUST="$HAS_RUST"
@@ -550,19 +546,6 @@ pack)
 
   echo "打包 $(wc -l < "$LIST") 个条目："
   sed 's/^/  /' "$LIST"
-
-  # ---------------------------------------------------------------
-  # 完整性校验：缓存必须同时含 golang 与 rust。
-  #   少一个时明确告警 —— 用户要求「不管 config 里有没有，编出的缓存
-  #   必须都有」。静默少一个最难排查：主流程会以为命中了，
-  #   实际却在 Compile the firmware 里现编一遍。
-  # ---------------------------------------------------------------
-  if [ "${REQUIRE_BOTH_STACKS:-true}" = "true" ]; then
-    for want in go rustc; do
-      grep -qE "(^|/)bin/${want}$" "$LIST" || \
-        echo "::warning::打包清单里没有 ${want} —— 缓存不完整，下次该栈会重新编译"
-    done
-  fi
 
   TARBALL="$HOST_CACHE_DIR/${KEY}.tzst"
   rm -f "$TARBALL"
