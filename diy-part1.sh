@@ -44,12 +44,13 @@ ADD_TASKPLAN=true      # luci-app-taskplan（定时任务）
 ADD_OAF=true           # luci-app-oaf（应用过滤，含内核模块，高风险）
 ADD_LUCI_APP=true       # qwe-qaq/luci-app 仓库（monorepo）
                         #   ├─ luci-app-natmode     NAT 类型三选一（网络 → NAT 类型）
-                        #   └─ luci-app-pon-status  PON 光模块卡片（概览页「系统」下一格）
+                        #   ├─ luci-app-pon-status  PON 光模块卡片（概览页「系统」下一格）
+                        #   └─ luci-app-igmpproxy    IGMP Proxy 组播代理 Web 界面
 # 下面这几个开关都能被环境变量覆盖（: ${VAR:=默认} 的写法）：
 # workflow 里选了「不拉私有仓库」时会注入 ADD_FTTR=false，整段直接跳过。
 : "${ADD_FTTR:=true}"       # FTTR 全家桶总开关（下面的子开关都受它管）★仅 HM2004-DU
 : "${ADD_FMCS:=true}"       # h3c-fmcs：Micro-OLT FPGA 内核驱动（kmod-h3c-fmcs）
-: "${ADD_FTTR_TOOLS:=true}" # h3c-fttr-tools：fttrd 控制器 + fttrctl（Rust 包）
+: "${ADD_FTTR_TOOLS:=true}" # openwrt-fttr：fttrd 控制器 + fttrctl（Rust 包）
 : "${ADD_FMCS_FW:=true}"    # h3c-fmcs-firmware：FPGA 比特流 FTTR_TOP.sbit
 : "${ADD_FTTR_LUCI:=true}"  # luci-app-fttr：界面包（公开 CI 生成的 package 分支）
                             # （前三个来自 openwrt-fttr 私有仓库；界面包单独拉，见下方）
@@ -81,21 +82,22 @@ clone() {  # clone <url> <dir> [branch]
   return 1
 }
 # =========================================================
-# qwe3017/luci-app —— 两个 LuCI 插件的来源
+# qwe3017/luci-app —— 三个 LuCI 插件的来源
 #
 # 这是一个 monorepo，结构为：
 #   luci-app/
 #   ├── luci-app-natmode/
-#   └── luci-app-pon-status/
+#   ├── luci-app-pon-status/
+#   └── luci-app-igmpproxy/
 # =========================================================
 if [ "$ADD_LUCI_APP" = "true" ]; then
   LUCI_APP_URL="https://github.com/qwe-qaq/luci-app"
   LUCI_APP_TMP="$(mktemp -d)/luci-app"
   if ! clone "$LUCI_APP_URL" "$LUCI_APP_TMP" main; then
-    echo "::error::qwe3017/luci-app 拉取失败，natmode / pon-status 会被 defconfig 剔除"
+    echo "::error::qwe3017/luci-app 拉取失败，natmode / pon-status / igmpproxy 会被 defconfig 剔除"
     exit 1
   fi
-  for p in luci-app-natmode luci-app-pon-status; do
+  for p in luci-app-natmode luci-app-pon-status luci-app-igmpproxy; do
     if [ ! -f "$LUCI_APP_TMP/$p/Makefile" ]; then
       echo "::error::$LUCI_APP_TMP/$p/Makefile 不存在，包无法被索引"
       exit 1
@@ -108,16 +110,19 @@ if [ "$ADD_LUCI_APP" = "true" ]; then
 fi
 
 # =========================================================
-# h3c-fmcs / h3c-fttr-tools / h3c-fmcs-firmware —— FTTR 后端三件套 ★HM2004-DU 专属
+# h3c-fmcs / openwrt-fttr / h3c-fmcs-firmware —— FTTR 后端三件套 ★HM2004-DU 专属
 # 源：qwe-qaq/openwrt-fttr（私有仓库）
 # ⚠ 这里必须用「裸 URL」：凭证由 workflow 的 GIT_ASKPASS 在认证时回调注入，
 #   千万别拼 token —— clone 的 echo 会把它打进日志。
-# ⚠ 该仓库是 feed 形态（根目录直接是三个包目录），按目录名拷进 package/custom/
-#   即可；目录名必须等于包名（PKG_NAME ?= $(notdir $(CURDIR)）），否则 config
-#   里的 CONFIG_PACKAGE_xxx 对不上。
+# ⚠ 该仓库是 feed 形态（根目录直接是包目录），拷进 package/custom/ 即可。
+#   内核包 / 固件包目录名 = 包名；用户态 Rust 包在 2026-11 由 h3c-fttr-tools
+#   改名为 openwrt-fttr（Makefile 已显式写死 PKG_NAME:=openwrt-fttr 与
+#   BuildPackage,openwrt-fttr），但源目录在不同快照里可能是 fttr /
+#   fttr-tools / h3c-fttr-tools。下面按候选名探测，统一拷成
+#   package/custom/openwrt-fttr/，让索引包名与 config 的 =y 对得上。
 #   h3c-fmcs           KernelPackage → 索引里叫 kmod-h3c-fmcs，DEPENDS 限定
 #                      @(TARGET_airoha_an7581)，另依赖 +kmod-spi-gpio
-#   h3c-fttr-tools     Rust 包，硬 include feeds/packages/lang/rust/rust-package.mk
+#   openwrt-fttr       Rust 包，硬 include feeds/packages/lang/rust/rust-package.mk
 #   h3c-fmcs-firmware  纯数据包，FPGA 比特流 → /lib/firmware/FTTR_TOP.sbit
 # ⚠ h3c-fmcs 是 KernelPackage，索引里的名字是 kmod-h3c-fmcs。下面的包索引
 #   校验内置了这层映射（pkgname_of），看到的是 ✅ h3c-fmcs → kmod-h3c-fmcs。
@@ -128,23 +133,37 @@ if [ "$ADD_FTTR" = "true" ] && [ "$FTTR_PROFILE" = "h3c_hm2004-du" ]; then
   FTTR_FEED_BRANCH="${PRIVATE_REPO_BRANCH:-main}"
   FTTR_FEED_TMP="$(mktemp -d)/openwrt-fttr"
   if ! clone "$FTTR_FEED_URL" "$FTTR_FEED_TMP" "$FTTR_FEED_BRANCH"; then
-    echo "::error::openwrt-fttr 拉取失败：${FTTR_FEED_URL} (分支 ${FTTR_FEED_BRANCH})，kmod-h3c-fmcs / h3c-fttr-tools / h3c-fmcs-firmware 会被 defconfig 剔除；luci-app-fttr 因依赖 +h3c-fttr-tools 也会被连带剔除"
+    echo "::error::openwrt-fttr 拉取失败：${FTTR_FEED_URL} (分支 ${FTTR_FEED_BRANCH})，kmod-h3c-fmcs / openwrt-fttr / h3c-fmcs-firmware 会被 defconfig 剔除；luci-app-fttr 因依赖 +openwrt-fttr 也会被连带剔除"
     echo "        公开仓库失败=仓库/分支名不对；私有仓库缺凭证=优先查 GitHub App（PRIVATE_SOURCE_APP_ID / PRIVATE_SOURCE_APP_PRIVATE_KEY，App 要装到该仓库且 Contents: Read-only），回退才看 Secret PRIVATE_REPO_TOKEN 是否有效（PAT 需对该仓库有 Contents 读权限）"
     exit 1
   fi
 
-  # h3c-fttr-tools 硬 include 了 feeds/packages/lang/rust/rust-package.mk，
+  # openwrt-fttr 硬 include 了 feeds/packages/lang/rust/rust-package.mk，
   # 这个文件不在的话 dump 直接失败、包静默不进索引。
   # 与其等到 defconfig 把它剔掉才发现，不如在这里就报错退出。
   if [ "$ADD_FTTR_TOOLS" = "true" ] && [ ! -f feeds/packages/lang/rust/rust-package.mk ]; then
-    echo "::error::未找到 feeds/packages/lang/rust/rust-package.mk，h3c-fttr-tools 无法索引"
+    echo "::error::未找到 feeds/packages/lang/rust/rust-package.mk，openwrt-fttr 无法索引"
     echo "        确认 packages feed 已 update + install；或把 ADD_FTTR_TOOLS 置为 false"
+    exit 1
+  fi
+
+  # 用户态后端改名后源目录不稳定（fttr / fttr-tools / h3c-fttr-tools），
+  # 逐个探测；拷进 package/custom 时统一用包名 openwrt-fttr。
+  FTTR_TOOLS_SRC=""
+  for cand in fttr fttr-tools h3c-fttr-tools openwrt-fttr; do
+    if [ -f "$FTTR_FEED_TMP/$cand/Makefile" ]; then
+      FTTR_TOOLS_SRC="$cand"
+      break
+    fi
+  done
+  if [ "$ADD_FTTR_TOOLS" = "true" ] && [ -z "$FTTR_TOOLS_SRC" ]; then
+    echo "::error::openwrt-fttr 源目录未找到（依次试过 fttr / fttr-tools / h3c-fttr-tools / openwrt-fttr）"
     exit 1
   fi
 
   FTTR_FEED_PKGS=""
   [ "$ADD_FMCS" = "true" ]       && FTTR_FEED_PKGS="$FTTR_FEED_PKGS h3c-fmcs"
-  [ "$ADD_FTTR_TOOLS" = "true" ] && FTTR_FEED_PKGS="$FTTR_FEED_PKGS h3c-fttr-tools"
+  [ "$ADD_FTTR_TOOLS" = "true" ] && FTTR_FEED_PKGS="$FTTR_FEED_PKGS $FTTR_TOOLS_SRC"
   [ "$ADD_FMCS_FW" = "true" ]    && FTTR_FEED_PKGS="$FTTR_FEED_PKGS h3c-fmcs-firmware"
 
   for p in $FTTR_FEED_PKGS; do
@@ -152,9 +171,14 @@ if [ "$ADD_FTTR" = "true" ] && [ "$FTTR_PROFILE" = "h3c_hm2004-du" ]; then
       echo "::error::$FTTR_FEED_TMP/$p/Makefile 不存在（上游改结构了？）"
       exit 1
     fi
-    rm -rf "$PKG_DIR/$p"
-    cp -a "$FTTR_FEED_TMP/$p" "$PKG_DIR/$p"
-    echo "✅ 已拷贝: $p  (版本 $(grep -m1 '^PKG_VERSION' "$PKG_DIR/$p/Makefile" 2>/dev/null | sed 's/PKG_VERSION:=//'))"
+    # 源目录名可能与包名不同，统一落到与 CONFIG_PACKAGE_ 一致的目录名
+    case "$p" in
+      fttr|fttr-tools|h3c-fttr-tools|openwrt-fttr) dst="openwrt-fttr" ;;
+      *) dst="$p" ;;
+    esac
+    rm -rf "$PKG_DIR/$dst"
+    cp -a "$FTTR_FEED_TMP/$p" "$PKG_DIR/$dst"
+    echo "✅ 已拷贝: $p → $dst  (版本 $(grep -m1 '^PKG_VERSION' "$PKG_DIR/$dst/Makefile" 2>/dev/null | sed 's/PKG_VERSION:=//'))"
   done
   rm -rf "$FTTR_FEED_TMP"
 fi
@@ -168,7 +192,7 @@ fi
 # 因此编译阶段不再联网取前端、也不存在 hash 失效问题。
 # ⚠ package 分支是 orphan + force-push 生成（每次只有 1 个 commit），
 #   必须用 --depth 1 每次重新 clone，不能复用旧目录。
-# ⚠ Makefile 里 LUCI_DEPENDS:=+luci-base +rpcd +h3c-fttr-tools，后端仍由
+# ⚠ Makefile 里 LUCI_DEPENDS:=+luci-base +rpcd +openwrt-fttr，后端仍由
 #   上面的私有 feed 提供；私库里若还留着旧 luci-app-fttr/ 目录，本脚本
 #   不会拷它（已从 FTTR_FEED_PKGS 移除），可自行清理避免混淆。
 # ⚠ CI 生成的 Makefile 漏了「# call BuildPackage - OpenWrt buildroot
@@ -376,15 +400,15 @@ if [ "$ADD_OAF" = "true" ]; then
   rm -rf "$PKG_DIR/OpenAppFilter"
 fi
 # ---------------------------------------------------------
-# 校验：默认开启的两个插件必须拉到，否则 defconfig 会静默剔除，
+# 校验：默认开启的三个插件必须拉到，否则 defconfig 会静默剔除，
 #       编出来的固件缺少状态页还不易察觉
 # ---------------------------------------------------------
 if [ "$ADD_AIROHA_NPU" = "true" ] && [ ! -d "$PKG_DIR/luci-app-airoha-npu" ]; then
   echo "::error::luci-app-airoha-npu 未拉到，config 里的 =y 会被 defconfig 剔除"
   exit 1
 fi
-# natmode / pon-status 来自 qwe3017/luci-app（config 里也是 =y）
-for p in luci-app-natmode luci-app-pon-status; do
+# natmode / pon-status / igmpproxy 来自 qwe3017/luci-app（config 里也是 =y）
+for p in luci-app-natmode luci-app-pon-status luci-app-igmpproxy; do
   if [ "$ADD_LUCI_APP" = "true" ] && [ ! -d "$PKG_DIR/$p" ]; then
     echo "::error::$p 未拉到，config 里的 =y 会被 defconfig 剔除"
     exit 1
@@ -551,7 +575,7 @@ if [ -n "$(ls -A "$PKG_DIR" 2>/dev/null)" ]; then
   REQUIRED=""
   [ "$ADD_AIROHA_NPU" = "true" ] && REQUIRED="$REQUIRED luci-app-airoha-npu"
   if [ "$ADD_LUCI_APP" = "true" ]; then
-    REQUIRED="$REQUIRED luci-app-natmode luci-app-pon-status"
+    REQUIRED="$REQUIRED luci-app-natmode luci-app-pon-status luci-app-igmpproxy"
   fi
 
   # 与 configs/an7581.config / an7583.config 里 =y 的包一一对应。
@@ -581,13 +605,13 @@ if [ -n "$(ls -A "$PKG_DIR" 2>/dev/null)" ]; then
       REQUIRED="$REQUIRED h3c-fmcs-firmware"
     fi
     if [ "$ADD_FTTR_TOOLS" = "true" ]; then
-      REQUIRED="$REQUIRED h3c-fttr-tools"
+      REQUIRED="$REQUIRED openwrt-fttr"
     fi
     if [ "$ADD_FTTR_LUCI" = "true" ]; then
       REQUIRED="$REQUIRED luci-app-fttr"
     fi
     # =========================================================
-    # luci-app-fttr 依赖 +h3c-fttr-tools，后者依赖 +kmod-h3c-fmcs。
+    # luci-app-fttr 依赖 +openwrt-fttr，后者依赖 +kmod-h3c-fmcs。
     # 链条上任一节不在树里，defconfig 都会静默把整条 FTTR 剔掉 —— 与其编出
     # 一个没有 FTTR 界面的固件还不易察觉，不如在这里直接报错。
     # 前者最常见原因是缺 rust-package.mk；后者受 @(TARGET_airoha_an7581) 限制。
@@ -595,8 +619,8 @@ if [ -n "$(ls -A "$PKG_DIR" 2>/dev/null)" ]; then
     # 提交，编译不联网；后端三件套仍由私有 feed 提供。
     # =========================================================
     if [ "$ADD_FTTR_TOOLS" = "true" ] &&
-       ! grep -qx "Package: h3c-fttr-tools" tmp/.packageinfo 2>/dev/null; then
-      echo "::error::h3c-fttr-tools 不在包索引里（luci-app-fttr 的后端，Rust 包）"
+       ! grep -qx "Package: openwrt-fttr" tmp/.packageinfo 2>/dev/null; then
+      echo "::error::openwrt-fttr 不在包索引里（luci-app-fttr 的后端，Rust 包）"
       echo "        多半是缺 rust feed：确认 feeds.conf 里有 packages，且"
       echo "        ./scripts/feeds install 装到了 lang/rust。"
       echo "        不需要 FTTR 就把 diy-part1.sh 的 ADD_FTTR 改成 false。"
@@ -604,7 +628,7 @@ if [ -n "$(ls -A "$PKG_DIR" 2>/dev/null)" ]; then
     fi
     if [ "$ADD_FMCS" = "true" ] &&
        ! grep -qx "Package: kmod-h3c-fmcs" tmp/.packageinfo 2>/dev/null; then
-      echo "::error::kmod-h3c-fmcs 不在包索引里（h3c-fttr-tools 依赖它）"
+      echo "::error::kmod-h3c-fmcs 不在包索引里（openwrt-fttr 依赖它）"
       echo "        DEPENDS 是 @(TARGET_airoha_an7581)：非该 target 时包不会进索引。"
       echo "        不需要 FTTR 就把 diy-part1.sh 的 ADD_FTTR 改成 false。"
       exit 1
